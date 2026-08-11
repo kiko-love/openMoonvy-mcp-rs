@@ -106,12 +106,6 @@ pub struct Blend {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
-pub struct SliceInfo {
-    pub id: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
 pub struct GenomeNode {
     pub id: Option<String>,
     pub name: Option<String>,
@@ -123,7 +117,8 @@ pub struct GenomeNode {
     pub blend: Option<Blend>,
     pub border_radius: Option<f64>,
     pub fill_link: Option<String>,
-    pub slices: Option<HashMap<String, SliceInfo>>,
+    /// Some nodes carry `slices: true` (boolean) instead of a map.
+    pub slices: Option<serde_json::Value>,
     pub snapshot: Option<String>,
     pub snapshot_preview: Option<String>,
     pub children: Vec<GenomeNode>,
@@ -433,7 +428,176 @@ pub fn extract_tree(genome: &Genome, frame_filter: Option<&str>, options: &TreeO
         .collect()
 }
 
-/* -------------------------------- misc helpers ----------------------------- */
+/* -------------------------------- layers/style ----------------------------- */
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Layer {
+    pub id: String,
+    pub name: String,
+    pub r#type: String,
+    pub x: i64,
+    pub y: i64,
+    pub width: i64,
+    pub height: i64,
+}
+
+pub fn extract_layers(genome: &Genome, frame_filter: Option<&str>, limit: usize) -> Vec<Layer> {
+    let mut all: Vec<(&GenomeNode, usize)> = Vec::new();
+    for page in &genome.pages {
+        if frame_filter.is_some() && !ids_equal(page.id.as_deref(), frame_filter) {
+            continue;
+        }
+        collect_nodes_flat(page, 0, &mut all);
+    }
+    all.iter()
+        .take(limit)
+        .map(|(node, _)| {
+            let rect = node.rect.clone().unwrap_or_default();
+            Layer {
+                id: node.id.clone().unwrap_or_default(),
+                name: node.name.clone().unwrap_or_default(),
+                r#type: node.r#type.clone().unwrap_or_default(),
+                x: rect.x.round() as i64,
+                y: rect.y.round() as i64,
+                width: rect.w.round() as i64,
+                height: rect.h.round() as i64,
+            }
+        })
+        .collect()
+}
+
+fn collect_nodes_flat<'a>(node: &'a GenomeNode, depth: usize, out: &mut Vec<(&'a GenomeNode, usize)>) {
+    out.push((node, depth));
+    for child in &node.children {
+        collect_nodes_flat(child, depth + 1, out);
+    }
+}
+
+pub fn find_node<'a>(node: &'a GenomeNode, target_id: &str) -> Option<&'a GenomeNode> {
+    if ids_equal(node.id.as_deref(), Some(target_id)) {
+        return Some(node);
+    }
+    for child in &node.children {
+        if let Some(found) = find_node(child, target_id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct StyleRow {
+    pub id: String,
+    pub name: String,
+    pub bbox_x: i64,
+    pub bbox_y: i64,
+    pub bbox_w: i64,
+    pub bbox_h: i64,
+    #[serde(flatten)]
+    pub style: NodeStyle,
+}
+
+pub fn extract_node_style(genome: &Genome, node_id: &str) -> Vec<StyleRow> {
+    let raw = genome.pages.iter().find_map(|page| find_node(page, node_id));
+    let raw = raw.cloned().unwrap_or_else(|| GenomeNode {
+        id: Some(node_id.to_string()),
+        name: Some("Unknown Node".to_string()),
+        r#type: Some("unknown".to_string()),
+        rect: Some(Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }),
+        ..Default::default()
+    });
+    let rect = raw.rect.clone().unwrap_or_default();
+    let style = extract_raw_node_style(genome, &raw);
+    vec![StyleRow {
+        id: raw.id.clone().unwrap_or_default(),
+        name: raw.name.clone().unwrap_or_default(),
+        bbox_x: rect.x.round() as i64,
+        bbox_y: rect.y.round() as i64,
+        bbox_w: rect.w.round() as i64,
+        bbox_h: rect.h.round() as i64,
+        style,
+    }]
+}
+
+/* ---------------------------------- diff ----------------------------------- */
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TreeDiff {
+    pub added: Vec<TreeNode>,
+    pub removed: Vec<TreeNode>,
+    pub changed: Vec<ChangedNode>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ChangedNode {
+    pub id: String,
+    pub name: String,
+    pub fields: Vec<String>,
+}
+
+fn flatten_tree(nodes: &[TreeNode]) -> Vec<(&TreeNode, String)> {
+    let mut out = Vec::new();
+    let mut stack: Vec<&TreeNode> = nodes.iter().collect();
+    while let Some(node) = stack.pop() {
+        out.push((node, node.id.clone()));
+        if let Some(children) = &node.children {
+            stack.extend(children.iter());
+        }
+    }
+    out
+}
+
+fn style_signature(style: &Option<NodeStyle>) -> String {
+    match style {
+        Some(s) => format!(
+            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+            s.background, s.color, s.font_size, s.border_radius, s.stroke_width, s.gradient.as_ref().map(|g| g.r#type.clone()), s.opacity
+        ),
+        None => String::new(),
+    }
+}
+
+fn changed_fields(a: &TreeNode, b: &TreeNode) -> Vec<String> {
+    let mut fields = Vec::new();
+    if a.text != b.text {
+        fields.push("text".to_string());
+    }
+    if style_signature(&a.style) != style_signature(&b.style) {
+        fields.push("style".to_string());
+    }
+    if a.children.as_ref().map(|c| c.len()) != b.children.as_ref().map(|c| c.len()) {
+        fields.push("childrenCount".to_string());
+    }
+    if a.x != b.x || a.y != b.y || a.width != b.width || a.height != b.height {
+        fields.push("rect".to_string());
+    }
+    fields
+}
+
+pub fn diff_trees(a: &[TreeNode], b: &[TreeNode]) -> TreeDiff {
+    let by_id_a: HashMap<String, &TreeNode> = flatten_tree(a).into_iter().map(|(n, id)| (id, n)).collect();
+    let by_id_b: HashMap<String, &TreeNode> = flatten_tree(b).into_iter().map(|(n, id)| (id, n)).collect();
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    let mut changed = Vec::new();
+    for (id, node_b) in &by_id_b {
+        match by_id_a.get(id) {
+            None => added.push((*node_b).clone()),
+            Some(node_a) => {
+                let fields = changed_fields(node_a, node_b);
+                if !fields.is_empty() {
+                    changed.push(ChangedNode { id: id.clone(), name: node_b.name.clone(), fields });
+                }
+            }
+        }
+    }
+    for (id, node_a) in &by_id_a {
+        if !by_id_b.contains_key(id) {
+            removed.push((*node_a).clone());
+        }
+    }
+    TreeDiff { added, removed, changed }
+}
 
 pub fn ids_equal(a: Option<&str>, b: Option<&str>) -> bool {
     let (Some(a), Some(b)) = (a, b) else { return false };

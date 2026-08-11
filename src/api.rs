@@ -16,7 +16,8 @@ pub struct MoonvyApi {
     base: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
 #[allow(dead_code)]
 pub struct MoonvyNode {
     pub id: String,
@@ -25,6 +26,15 @@ pub struct MoonvyNode {
     pub is_dir: Option<bool>,
     pub files: Option<Files>,
     pub meta: Option<NodeMeta>,
+    pub preview: Option<Preview>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+#[allow(dead_code)]
+pub struct Preview {
+    pub normal: Option<String>,
+    pub large: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -92,10 +102,26 @@ impl MoonvyApi {
         }
         let bytes = resp.bytes().await.context("failed to read genome body")?;
         if bytes.starts_with(b"{") || bytes.starts_with(b"[") {
-            return serde_json::from_slice(&bytes).context("genome is not valid JSON");
+            return serde_json::from_slice(&bytes).map_err(|e| anyhow!("genome is not valid JSON: {e}"));
         }
         let decompressed = flate2::read::GzDecoder::new(bytes.as_ref());
         serde_json::from_reader(decompressed).context("failed to decompress genome")
+    }
+
+    /// Download a file (asset / preview) into memory.
+    pub async fn download_file(&self, url: &str) -> anyhow::Result<Vec<u8>> {
+        let resp = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("download failed: {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(anyhow!("download failed: HTTP {status}"));
+        }
+        let bytes = resp.bytes().await.context("failed to read download body")?;
+        Ok(bytes.to_vec())
     }
 
     async fn post<T: serde::de::DeserializeOwned>(&self, path: &str, body: &Value) -> anyhow::Result<T> {
@@ -125,14 +151,12 @@ pub struct MoonvyUrl {
 }
 
 pub fn parse_moonvy_url(url: &str) -> Option<MoonvyUrl> {
-    let path = url.split('?').next()?;
-    let mut parts = path.split('/').filter(|s| !s.is_empty());
-    if parts.next()? != "project" {
-        return None;
-    }
-    let project_id = parts.next()?.to_string();
-    let dir_id = parts.next().map(str::to_string);
-    let file_id = parts.next().map(str::to_string);
+    let segments: Vec<&str> = url.split('/').filter(|s| !s.is_empty()).collect();
+    let idx = segments.iter().position(|s| *s == "project")?;
+    let rest = &segments[idx + 1..];
+    let project_id = rest.first()?.to_string();
+    let dir_id = rest.get(1).map(|s| s.to_string());
+    let file_id = rest.get(2).map(|s| s.to_string());
     Some(MoonvyUrl { project_id, dir_id, file_id })
 }
 

@@ -6,9 +6,11 @@
  */
 
 mod api;
+mod catalog;
 mod genome;
 mod server;
 mod token;
+mod tools;
 
 use std::sync::Arc;
 

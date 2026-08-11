@@ -11,13 +11,22 @@
 - 🌳 输出降噪：`skipEmptyGroups`（丢弃空容器）、`flatten`（画板原点绝对坐标）、`only`（类型过滤）、`detectDuplicates`（重复标注）
 - 📐 强类型：serde 解析 genome，字段错误编译期发现
 
-## 工具（PoC）
+## 工具（12 个，与 TypeScript 版行为对齐）
 
 | 工具 | 说明 |
 |---|---|
 | `moonvy_get_design` | 设计元数据（标题、画框尺寸） |
-| `moonvy_get_tree` | 图层树，支持 `withStyle` / `skipEmptyGroups` / `flatten` / `only` / `detectDuplicates` |
+| `moonvy_get_tree` | 图层树：`withStyle` / `skipEmptyGroups` / `flatten` / `only` / `detectDuplicates` / `includeAssets` |
 | `moonvy_extract_tokens` | 设计 Token（colors/fontSizes/radii/spacing） |
+| `moonvy_list_pages` | 项目文件列表（分页 BFS，含 preview 缩略图） |
+| `moonvy_list_layers` | 扁平图层列表（找节点 ID） |
+| `moonvy_get_node_style` | 单节点样式（含 strokeWidth/strokeColor/gradient） |
+| `moonvy_get_design_context` | 一次返回 元数据+图层树+Token（聚合入口） |
+| `moonvy_download_asset` | 下载切图/快照/图片填充 |
+| `moonvy_sync_project` | 扫描项目写入 `.moonvy-mcp/catalog.json` 索引 |
+| `moonvy_search_designs` | 按名称/别名/标签检索索引 |
+| `moonvy_get_tree_by_name` | 按名称取图层树 |
+| `moonvy_diff_designs` | 对比两个设计（added/removed/changed） |
 
 ## 构建
 
@@ -54,21 +63,23 @@ mkdir -p ~/.moonvy-ai && # 写入 token.json: {"token":"<JWT>", ...}
 ```
 src/
 ├── main.rs     # stdio 入口（rmcp 官方 Rust SDK）
-├── server.rs   # MCP 工具（tool_router 宏）
+├── server.rs   # MCP 工具注册与 schema（#[tool_router] 宏）
+├── tools.rs    # 业务逻辑（分页/资产/catalog）
 ├── api.rs      # Moonvy API 客户端（reqwest + gzip）
-├── genome.rs   # genome 解析（树/样式/token，纯函数）
+├── genome.rs   # genome 解析（树/样式/token/diff，纯函数）
+├── catalog.rs  # workspace 索引（catalog.json + 检索）
 └── token.rs    # token 加载
 ```
 
-行为契约与 TypeScript 版（moonvy-ai）对齐：相同的节点结构、样式归一化、树选项语义。
+行为契约与 TypeScript 版（moonvy-ai）对齐：相同的节点结构、样式归一化、树选项语义、catalog 检索排序。
 
 ## 路线图
 
-- [x] PoC：3 核心工具 + stdio + 真实 API 实测
-- [ ] 全量工具（list_pages/layers/style/sync/search/asset/diff）
+- [x] 全量工具移植（12 个，真实 API 实测通过）
 - [ ] 自动登录（浏览器 CDP）
 - [ ] cargo-dist 发布（GitHub Releases + Homebrew + crates.io）
-- [ ] 单元测试（Rust）
+- [ ] Rust 单元测试
+- [ ] 目录 URL 自动解析（当前需文件 URL）
 
 ## License
 
