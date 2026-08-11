@@ -20,7 +20,9 @@ pub struct CatalogDesign {
     pub url: String,
     pub project_id: String,
     pub parent_id: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub aliases: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub tags: Vec<String>,
     pub last_synced_at: String,
 }

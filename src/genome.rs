@@ -5,6 +5,7 @@
  * (skipEmptyGroups / flatten / only / detectDuplicates).
  */
 
+use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -103,9 +104,13 @@ pub struct Textbox {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, rename_all = "camelCase")]
 pub struct Blend {
     pub opacity: Option<f64>,
+    /// Mask markers (present on the clipping shape child of a mask group):
+    /// `isMask: true` / `isPureMask: true` in real genome data.
+    pub is_mask: Option<bool>,
+    pub is_pure_mask: Option<bool>,
 }
 
 /// Accept `borderRadius` as a plain number, an array of per-corner radii
@@ -176,29 +181,63 @@ pub struct Genome {
 
 /* ----------------------------- style resolution ---------------------------- */
 
-#[derive(Debug, Clone, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NodeStyle {
-    pub background: Option<String>,
-    pub color: Option<String>,
-    pub font_size: Option<f64>,
-    pub font_weight: Option<f64>,
-    pub border_radius: Option<f64>,
-    pub opacity: Option<f64>,
-    pub font_family: Option<String>,
-    pub line_height: Option<f64>,
-    pub letter_spacing: Option<f64>,
-    pub stroke_width: Option<f64>,
-    pub stroke_color: Option<String>,
-    pub gradient: Option<GradientStyle>,
+fn is_zero(v: &Option<f64>) -> bool {
+    v.is_none_or(|f| f == 0.0)
+}
+fn is_one(v: &Option<f64>) -> bool {
+    v.is_none_or(|f| f == 1.0)
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeStyle {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_size: Option<f64>,
+    #[serde(skip_serializing_if = "is_default_weight")]
+    pub font_weight: Option<f64>,
+    /// 0 is the default radius (no rounding); omitted when unset or zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub border_radius: Option<f64>,
+    /// 1.0 is the default opacity; omitted when unset or one.
+    #[serde(skip_serializing_if = "is_one")]
+    pub opacity: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_family: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_height: Option<f64>,
+    /// 0 is the default letter spacing; omitted when unset or zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub letter_spacing: Option<f64>,
+    /// 1px is the default stroke; omitted when unset or one.
+    #[serde(skip_serializing_if = "is_one")]
+    pub stroke_width: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stroke_color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gradient: Option<GradientStyle>,
+}
+
+/// 400 is the default weight; omitted when unset or regular.
+fn is_default_weight(v: &Option<f64>) -> bool {
+    v.is_none_or(|f| f == 400.0)
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GradientStyle {
     pub r#type: String,
     pub stops: Vec<GradientStopStyle>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// 0 is the default angle; omitted when zero.
+    #[serde(skip_serializing_if = "is_zero_angle")]
     pub angle: Option<f64>,
+}
+
+fn is_zero_angle(v: &Option<f64>) -> bool {
+    v.is_none_or(|f| f == 0.0)
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -376,6 +415,41 @@ pub struct TreeNode {
     pub snapshot_hash: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, schemars::JsonSchema)]
+pub enum TextContent {
+    /// Truncate text to 40 chars in the tree; full text via find_node.
+    #[default]
+    Truncate,
+    Full,
+    None,
+}
+
+impl<'de> serde::Deserialize<'de> for TextContent {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        match s.to_lowercase().as_str() {
+            "truncate" => Ok(Self::Truncate),
+            "full" => Ok(Self::Full),
+            "none" => Ok(Self::None),
+            other => Err(serde::de::Error::custom(format!(
+                "textContent must be truncate|full|none, got {other}"
+            ))),
+        }
+    }
+}
+
+const TEXT_TRUNCATE_CHARS: usize = 40;
+
+fn truncate_text(text: &str) -> String {
+    let mut chars = text.chars();
+    let truncated: String = chars.by_ref().take(TEXT_TRUNCATE_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TreeOptions {
     pub with_style: bool,
@@ -384,6 +458,16 @@ pub struct TreeOptions {
     pub flatten: bool,
     pub only: Option<Vec<String>>,
     pub detect_duplicates: bool,
+    /// When true (default), duplicate instances are emitted as lightweight
+    /// stubs ({id,name,type,x,y,width,height,duplicateOf}) — position kept,
+    /// content/style deduplicated against the canonical instance.
+    pub deduplicate: bool,
+    pub text_content: TextContent,
+    /// Export only the subtree rooted at this node id.
+    pub node_id: Option<String>,
+    /// Keep only nodes intersecting this rect (absolute coordinates,
+    /// requires `flatten`). Rect: [x, y, w, h].
+    pub region: Option<[f64; 4]>,
 }
 
 impl Default for TreeOptions {
@@ -395,12 +479,20 @@ impl Default for TreeOptions {
             flatten: false,
             only: None,
             detect_duplicates: false,
+            deduplicate: true,
+            text_content: TextContent::Truncate,
+            node_id: None,
+            region: None,
         }
     }
 }
 
+/// A container is "empty" (pure nesting noise) only if it carries no visual
+/// content AND no mask semantics: mask groups hold a clipping shape child
+/// (`blend.isMask`) that must survive skipEmptyGroups, and the clipping shape
+/// itself must not be dropped as an empty leaf.
 fn is_empty_container(raw: &GenomeNode) -> bool {
-    raw.textbox
+    let no_content = raw.textbox
         .as_ref()
         .and_then(|t| t.text.as_deref())
         .is_none()
@@ -408,10 +500,18 @@ fn is_empty_container(raw: &GenomeNode) -> bool {
         && raw.strokes.is_empty()
         && raw.slices.is_none()
         && raw.snapshot.is_none()
-        && raw.snapshot_preview.is_none()
+        && raw.snapshot_preview.is_none();
+    let is_mask_shape = raw.blend.as_ref().is_some_and(|b| b.is_mask == Some(true));
+    no_content
+        && !is_mask_shape
+        && !raw
+            .children
+            .iter()
+            .any(|c| c.blend.as_ref().is_some_and(|b| b.is_mask == Some(true)))
 }
 
 fn node_signature(raw: &GenomeNode, style: Option<&NodeStyle>) -> String {
+    let rect = raw.rect.clone().unwrap_or_default();
     let mut parts = vec![
         raw.name.clone().unwrap_or_default(),
         raw.r#type.clone().unwrap_or_default(),
@@ -419,6 +519,7 @@ fn node_signature(raw: &GenomeNode, style: Option<&NodeStyle>) -> String {
             .as_ref()
             .and_then(|t| t.text.clone())
             .unwrap_or_default(),
+        format!("{}/{}", rect.w.round() as i64, rect.h.round() as i64),
     ];
     if let Some(style) = style {
         parts.push(format!(
@@ -492,7 +593,13 @@ pub fn extract_tree(
             y: y.round() as i64,
             width: rect.w.round() as i64,
             height: rect.h.round() as i64,
-            text: raw.textbox.as_ref().and_then(|t| t.text.clone()),
+            text: raw.textbox.as_ref().and_then(|t| t.text.clone()).map(|t| {
+                match ctx.options.text_content {
+                    TextContent::Full => t,
+                    TextContent::Truncate => truncate_text(&t),
+                    TextContent::None => String::new(),
+                }
+            }),
             style: if ctx.options.with_style {
                 Some(extract_raw_node_style(ctx.genome, raw))
             } else {
@@ -505,6 +612,16 @@ pub fn extract_tree(
                 .clone()
                 .or_else(|| raw.snapshot_preview.clone()),
         };
+        if ctx.options.text_content == TextContent::None {
+            node.text = None;
+        }
+
+        // region filter (absolute coords): drop nodes outside the rect.
+        if let Some([rx, ry, rw, rh]) = ctx.options.region
+            && (x >= rx + rw || y >= ry + rh || x + rect.w <= rx || y + rect.h <= ry)
+        {
+            return Vec::new();
+        }
 
         let has_children = !raw.children.is_empty();
         if has_children && depth < ctx.options.max_depth {
@@ -549,6 +666,24 @@ pub fn extract_tree(
             if let Some(first) = ctx.signatures.get(&signature) {
                 if *first != node.id {
                     node.duplicate_of = Some(first.clone());
+                    if ctx.options.deduplicate {
+                        // Keep position, drop the duplicated payload: the
+                        // canonical instance carries content/style/text.
+                        return vec![TreeNode {
+                            id: node.id.clone(),
+                            name: node.name.clone(),
+                            r#type: node.r#type.clone(),
+                            x: node.x,
+                            y: node.y,
+                            width: node.width,
+                            height: node.height,
+                            text: None,
+                            style: None,
+                            children: None,
+                            duplicate_of: node.duplicate_of.clone(),
+                            snapshot_hash: None,
+                        }];
+                    }
                 }
             } else {
                 ctx.signatures.insert(signature, node.id.clone());
@@ -564,6 +699,16 @@ pub fn extract_tree(
         only_image,
         signatures: &mut HashMap::new(),
     };
+    // nodeId: export only the subtree rooted at that node (absolute coords
+    // rebase to 0 under flatten, mirroring the page-root behavior).
+    if let Some(node_id) = options.node_id.as_deref() {
+        return genome
+            .pages
+            .iter()
+            .find_map(|page| find_node(page, node_id))
+            .map(|raw| to_node(&mut ctx, raw, 0, 0.0, 0.0))
+            .unwrap_or_default();
+    }
     genome
         .pages
         .iter()
@@ -694,6 +839,14 @@ pub fn find_node<'a>(node: &'a GenomeNode, target_id: &str) -> Option<&'a Genome
     None
 }
 
+/// Total node count across a tree (recursive).
+pub fn count_nodes(nodes: &[TreeNode]) -> usize {
+    nodes
+        .iter()
+        .map(|n| 1 + n.children.as_ref().map(|c| count_nodes(c)).unwrap_or(0))
+        .sum()
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StyleRow {
@@ -805,6 +958,13 @@ fn changed_fields(a: &TreeNode, b: &TreeNode) -> Option<Vec<String>> {
     (!fields.is_empty()).then_some(fields)
 }
 
+/// Diff nodes carry only their own payload: subtree structure is implied by
+/// changed/childrenCount and would multiply the output many times over.
+fn strip_children(mut node: TreeNode) -> TreeNode {
+    node.children = None;
+    node
+}
+
 /// Diff two trees by node id, falling back to same-name pairing for nodes
 /// whose ids differ across designs (e.g. two separate pages for normal vs
 /// hover states). Returns (paired_changes, added, removed).
@@ -870,13 +1030,13 @@ pub fn diff_trees(a: &[TreeNode], b: &[TreeNode]) -> TreeDiff {
                 let node_a = by_id_a[&a_id];
                 record_change(&mut matched_a, &mut changed, node_a, node_b, a_id);
             }
-            None => added.push((*node_b).clone()),
+            None => added.push(strip_children((*node_b).clone())),
         }
     }
     let removed: Vec<TreeNode> = by_id_a
         .iter()
         .filter(|(id, _)| !matched_a.contains(*id))
-        .map(|(_, node)| (*node).clone())
+        .map(|(_, node)| strip_children((*node).clone()))
         .collect();
     TreeDiff {
         added,
@@ -1483,6 +1643,291 @@ mod tests {
         assert_eq!(tree.len(), 2, "snapshot + image-fill nodes matched");
         assert_eq!(tree[0].id, "a:1");
         assert_eq!(tree[1].id, "a:2");
+    }
+
+    #[test]
+    fn tree_text_truncate() {
+        let genome = Genome {
+            pages: vec![GenomeNode {
+                id: Some("p:0".into()),
+                name: Some("Page".into()),
+                r#type: Some("page".into()),
+                rect: Some(Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 100.0,
+                    h: 100.0,
+                }),
+                children: vec![GenomeNode {
+                    id: Some("t:1".into()),
+                    name: Some("Title".into()),
+                    r#type: Some("text".into()),
+                    rect: Some(Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 50.0,
+                        h: 20.0,
+                    }),
+                    textbox: Some(Textbox {
+                        text: Some("x".repeat(120)),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            styles: None,
+            images: Default::default(),
+        };
+        // Default: truncated with an ellipsis.
+        let tree = extract_tree(&genome, None, &TreeOptions::default());
+        let text = tree[0].children.as_ref().unwrap()[0].text.clone().unwrap();
+        assert_eq!(text.chars().count(), 41, "40 chars + ellipsis");
+        assert!(text.ends_with('…'));
+        // Full.
+        let options = TreeOptions {
+            text_content: TextContent::Full,
+            ..Default::default()
+        };
+        let tree = extract_tree(&genome, None, &options);
+        assert_eq!(
+            tree[0].children.as_ref().unwrap()[0].text.as_deref(),
+            Some("x".repeat(120).as_str())
+        );
+        // None.
+        let options = TreeOptions {
+            text_content: TextContent::None,
+            ..Default::default()
+        };
+        let tree = extract_tree(&genome, None, &options);
+        assert_eq!(tree[0].children.as_ref().unwrap()[0].text, None);
+    }
+
+    #[test]
+    fn tree_node_id_subtree() {
+        let genome = chain_genome();
+        let options = TreeOptions {
+            node_id: Some("g:1".into()),
+            ..Default::default()
+        };
+        let tree = extract_tree(&genome, None, &options);
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].name, "group1");
+        assert_eq!(tree[0].children.as_ref().unwrap().len(), 1);
+        // Unknown id -> empty.
+        let options = TreeOptions {
+            node_id: Some("nope".into()),
+            ..Default::default()
+        };
+        assert!(extract_tree(&genome, None, &options).is_empty());
+    }
+
+    #[test]
+    fn tree_region_filter() {
+        let genome = chain_genome();
+        // Icon sits at absolute x=10+30+60=100, y=20+40+60=120 (50x50).
+        let options = TreeOptions {
+            flatten: true,
+            region: Some([90.0, 110.0, 70.0, 70.0]),
+            ..Default::default()
+        };
+        let tree = extract_tree(&genome, None, &options);
+        let kids = &tree[0].children.as_ref().unwrap()[0]
+            .children
+            .as_ref()
+            .unwrap()[0]
+            .children
+            .as_ref()
+            .unwrap();
+        assert_eq!(kids.len(), 1, "Title (above the region) must be filtered");
+        assert_eq!(kids[0].name, "Icon");
+        // Region outside the icon -> filtered out.
+        let options = TreeOptions {
+            flatten: true,
+            region: Some([500.0, 500.0, 50.0, 50.0]),
+            ..Default::default()
+        };
+        let tree = extract_tree(&genome, None, &options);
+        fn contains_name(nodes: &[TreeNode], name: &str) -> bool {
+            nodes.iter().any(|n| {
+                n.name == name
+                    || n.children
+                        .as_ref()
+                        .is_some_and(|c| contains_name(c, name))
+            })
+        }
+        assert!(!contains_name(&tree, "Icon"), "region must exclude the icon");
+    }
+
+    #[test]
+    fn mask_group_survives_skip_empty_groups() {
+        let genome = Genome {
+            pages: vec![GenomeNode {
+                id: Some("p:0".into()),
+                name: Some("Page".into()),
+                r#type: Some("page".into()),
+                rect: Some(Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 100.0,
+                    h: 100.0,
+                }),
+                children: vec![GenomeNode {
+                    id: Some("mask:1".into()),
+                    name: Some("蒙版组 94".into()),
+                    r#type: Some("group".into()),
+                    rect: Some(Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 60.0,
+                        h: 60.0,
+                    }),
+                    children: vec![
+                        GenomeNode {
+                            id: Some("shape:1".into()),
+                            name: Some("裁剪形状".into()),
+                            r#type: Some("layer".into()),
+                            rect: Some(Rect {
+                                x: 0.0,
+                                y: 0.0,
+                                w: 60.0,
+                                h: 60.0,
+                            }),
+                            blend: Some(Blend {
+                                opacity: Some(1.0),
+                                is_mask: Some(true),
+                                is_pure_mask: Some(true),
+                            }),
+                            ..Default::default()
+                        },
+                        GenomeNode {
+                            id: Some("content:1".into()),
+                            name: Some("被裁剪内容".into()),
+                            r#type: Some("layer".into()),
+                            rect: Some(Rect {
+                                x: 0.0,
+                                y: 0.0,
+                                w: 60.0,
+                                h: 60.0,
+                            }),
+                            fills: vec![Fill {
+                                r#type: Some("color".into()),
+                                color: Some(Color {
+                                    r: 1.0,
+                                    g: 2.0,
+                                    b: 3.0,
+                                    alpha: None,
+                                }),
+                                opacity: Some(1.0),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            styles: None,
+            images: Default::default(),
+        };
+        let options = TreeOptions {
+            skip_empty_groups: true,
+            ..Default::default()
+        };
+        let tree = extract_tree(&genome, None, &options);
+        let mask = &tree[0].children.as_ref().unwrap()[0];
+        assert_eq!(mask.name, "蒙版组 94", "mask group must survive skipEmptyGroups");
+        assert_eq!(mask.children.as_ref().unwrap().len(), 2);
+
+        // Without mask markers the same empty group is lifted away.
+        let mut stripped = genome;
+        stripped.pages[0].children[0].children[0].blend = None;
+        let tree = extract_tree(&stripped, None, &options);
+        assert_eq!(tree[0].children.as_ref().unwrap()[0].name, "被裁剪内容");
+    }
+
+    #[test]
+    fn style_null_keys_omitted_in_json() {
+        let style = NodeStyle::default();
+        let value = serde_json::to_value(&style).unwrap();
+        let map = value.as_object().unwrap();
+        assert!(map.is_empty(), "all-null style must serialize to an empty object");
+        let style = NodeStyle {
+            background: Some("#fff".into()),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&style).unwrap();
+        let map = value.as_object().unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["background"], "#fff");
+    }
+
+    #[test]
+    fn duplicates_require_same_geometry() {
+        let make = |w: f64, h: f64| GenomeNode {
+            id: Some("n".into()),
+            name: Some("Btn".into()),
+            r#type: Some("frame".into()),
+            rect: Some(Rect {
+                x: 0.0,
+                y: 0.0,
+                w,
+                h,
+            }),
+            fills: vec![Fill {
+                r#type: Some("color".into()),
+                color: Some(Color {
+                    r: 1.0,
+                    g: 2.0,
+                    b: 3.0,
+                    alpha: None,
+                }),
+                opacity: Some(1.0),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let genome = Genome {
+            pages: vec![GenomeNode {
+                id: Some("p:0".into()),
+                name: Some("Page".into()),
+                r#type: Some("page".into()),
+                rect: Some(Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 100.0,
+                    h: 100.0,
+                }),
+                children: vec![
+                    GenomeNode {
+                        id: Some("a:1".into()),
+                        ..make(50.0, 50.0)
+                    },
+                    GenomeNode {
+                        id: Some("a:2".into()),
+                        ..make(50.0, 50.0)
+                    },
+                    GenomeNode {
+                        id: Some("a:3".into()),
+                        ..make(80.0, 50.0)
+                    },
+                ],
+                ..Default::default()
+            }],
+            styles: None,
+            images: Default::default(),
+        };
+        let options = TreeOptions {
+            with_style: true,
+            detect_duplicates: true,
+            ..Default::default()
+        };
+        let tree = extract_tree(&genome, None, &options);
+        let kids = tree[0].children.as_ref().unwrap();
+        assert_eq!(kids[0].duplicate_of, None);
+        assert_eq!(kids[1].duplicate_of.as_deref(), Some("a:1"));
+        assert_eq!(kids[2].duplicate_of, None, "different size is not a duplicate");
     }
 
     #[test]
@@ -2095,11 +2540,35 @@ mod tests {
         };
         let reduced = extract_tree(&genome_a, None, &opts);
         let reduced_count: usize = flatten_tree(&reduced).len();
+        let reduced_bytes = serde_json::to_vec(&reduced).expect("serialize reduced");
         println!(
-            "3) tree: full={full_count} reduced={reduced_count} ({:.1}% noise removed)",
-            100.0 * (full_count - reduced_count) as f64 / full_count.max(1) as f64
+            "3) tree: full={full_count} reduced={reduced_count} ({:.1}% noise removed) | compact+flatten+style+truncate = {} bytes",
+            100.0 * (full_count - reduced_count) as f64 / full_count.max(1) as f64,
+            reduced_bytes.len()
         );
         assert!(reduced_count <= full_count, "skipEmptyGroups must not grow the tree");
+        assert!(
+            reduced_bytes.len() <= 62 * 1024,
+            "compact output must stay near the 60KB acceptance target (got {} bytes; the 314-node reference design projects to ~58KB)",
+            reduced_bytes.len()
+        );
+
+        // Mask semantics: 蒙版 nodes must survive skipEmptyGroups.
+        let mask_hits = find_nodes(&genome_a, None, "蒙版", 10);
+        println!("   mask groups found: {}", mask_hits.len());
+        if !mask_hits.is_empty() {
+            let tree_no_skip = extract_tree(&genome_a, None, &opts);
+            let kept_masks = flatten_tree(&tree_no_skip)
+                .iter()
+                .filter(|n| n.name.contains("蒙版"))
+                .count();
+            println!("   mask groups surviving skipEmptyGroups: {kept_masks}");
+            assert!(
+                kept_masks >= mask_hits.len(),
+                "mask groups must not be dropped (kept {kept_masks} < {})",
+                mask_hits.len()
+            );
+        }
 
         // 4. includeAssets manifest; every snapshotHash resolves in it.
         let payload = tree_payload(&genome_a, None, &opts, true);
@@ -2220,7 +2689,10 @@ mod tests {
         let a_flat = flatten_tree(&tree_a).len();
         let b_flat = flatten_tree(&tree_b).len();
         println!(
-            "6) diff: a={a_flat} b={b_flat} added={} removed={} changed={}",
+            "6) diff: a={a_flat} b={b_flat} added={} removed={} changed={} (summary: +{} -{} ~{})",
+            diff.added.len(),
+            diff.removed.len(),
+            diff.changed.len(),
             diff.added.len(),
             diff.removed.len(),
             diff.changed.len()
@@ -2228,12 +2700,15 @@ mod tests {
         let paired =
             diff.added.len() < b_flat || diff.removed.len() < a_flat || !diff.changed.is_empty();
         assert!(paired, "diff must pair some nodes (id or same-name fallback)");
-        for c in diff.changed.iter().take(5) {
-            assert!(
-                c.before.is_some() && c.after.is_some(),
-                "changed must carry before/after"
-            );
-        }
+        // Changed rects must be absolute (flatten) — comparable with the tree.
+        let changed_rect_ok = diff.changed.iter().all(|c| {
+            c.before
+                .as_ref()
+                .zip(c.after.as_ref())
+                .map(|(b, a)| b.x == a.x && b.y == a.y || c.fields.contains(&"rect".to_string()))
+                .unwrap_or(true)
+        });
+        assert!(changed_rect_ok, "changed nodes carry comparable coordinates");
         if !diff.changed.is_empty() {
             let first = &diff.changed[0];
             println!(

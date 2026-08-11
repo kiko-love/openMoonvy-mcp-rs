@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Moonvy MCP server: full tool set. Business logic lives in tools.rs;
  * this module only declares tool schemas and routes calls.
  */
@@ -79,7 +79,7 @@ pub struct GetTreeRequest {
     pub url: String,
     /// Optional frame/page ID filter
     pub frame: Option<String>,
-    /// Include normalized style data for every node
+    /// Include normalized style data for every node (null style keys are omitted)
     #[serde(default)]
     pub with_style: bool,
     /// Maximum child depth to include
@@ -94,9 +94,20 @@ pub struct GetTreeRequest {
     /// Keep only nodes of these types (children filtered recursively)
     pub only: Option<Vec<String>>,
     /// Annotate nodes whose content repeats an earlier node with duplicateOf
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub detect_duplicates: bool,
-    /// Include the deduplicated asset manifest (hash -> url)
+    /// Collapse duplicate instances into position stubs (canonical keeps content)
+    #[serde(default = "default_true")]
+    pub deduplicate: bool,
+    /// Text payload in the tree: truncate (40 chars, default), full, or none
+    #[serde(default)]
+    pub text_content: Option<crate::genome::TextContent>,
+    /// Export only the subtree rooted at this node id
+    pub node_id: Option<String>,
+    /// Keep only nodes intersecting this rect: [x, y, w, h] in absolute
+    /// coordinates (requires flatten: true)
+    pub region: Option<Vec<f64>>,
+    /// Include the deduplicated asset manifest (hash -> {url, refs})
     #[serde(default)]
     pub include_assets: bool,
 }
@@ -201,8 +212,16 @@ pub struct ContextRequest {
     /// Keep only nodes of these types
     pub only: Option<Vec<String>>,
     /// Annotate nodes whose content repeats an earlier node with duplicateOf
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub detect_duplicates: bool,
+    /// Collapse duplicate instances into position stubs (canonical keeps content)
+    #[serde(default = "default_true")]
+    pub deduplicate: bool,
+    /// Text payload in the tree: truncate (40 chars, default), full, or none
+    #[serde(default)]
+    pub text_content: Option<crate::genome::TextContent>,
+    /// Export only the subtree rooted at this node id
+    pub node_id: Option<String>,
     /// Include the deduplicated asset manifest
     #[serde(default)]
     pub include_assets: bool,
@@ -284,8 +303,16 @@ pub struct TreeByNameRequest {
     /// Keep only nodes of these types (children filtered recursively)
     pub only: Option<Vec<String>>,
     /// Annotate nodes whose content repeats an earlier node with duplicateOf
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub detect_duplicates: bool,
+    /// Collapse duplicate instances into position stubs (canonical keeps content)
+    #[serde(default = "default_true")]
+    pub deduplicate: bool,
+    /// Text payload in the tree: truncate (40 chars, default), full, or none
+    #[serde(default)]
+    pub text_content: Option<crate::genome::TextContent>,
+    /// Export only the subtree rooted at this node id
+    pub node_id: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -307,11 +334,15 @@ pub struct DiffDesignsRequest {
     /// Drop empty container groups before comparing
     #[serde(default)]
     pub skip_empty_groups: bool,
-    /// Compare absolute coordinates (relative to the artboard origin)
-    #[serde(default)]
+    /// Compare absolute coordinates (relative to the artboard origin). On by
+    /// default so changed rects are comparable with moonvy_get_tree flatten.
+    #[serde(default = "default_true")]
     pub flatten: bool,
     /// Keep only nodes of these types before comparing
     pub only: Option<Vec<String>>,
+    /// Include before/after snapshots on changed nodes (more verbose)
+    #[serde(default)]
+    pub with_snapshots: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -353,7 +384,7 @@ impl MoonvyServer {
 
     #[tool(
         name = "moonvy_get_tree",
-        description = "Full layer tree. Returns { items: [ {id,name,type,x,y,width,height,text?,style?,children?,duplicateOf?} ], assets? }. Supports skipEmptyGroups, flatten, only, detectDuplicates, includeAssets."
+        description = "Full layer tree. Returns { items: [ {id,name,type,x,y,width,height,text?,style?,children?,duplicateOf?,snapshotHash?} ], assets? }. Supports skipEmptyGroups, flatten, only, detectDuplicates (on by default), textContent (truncate|full|none), nodeId (subtree export), region [x,y,w,h] (needs flatten), includeAssets."
     )]
     async fn get_tree(
         &self,
@@ -369,6 +400,16 @@ impl MoonvyServer {
             flatten: req.flatten,
             only: req.only,
             detect_duplicates: req.detect_duplicates,
+            deduplicate: req.deduplicate,
+            text_content: req.text_content.unwrap_or_default(),
+            node_id: req.node_id,
+            region: req.region.map(|r| {
+                let mut a = [0.0; 4];
+                for (i, v) in r.iter().take(4).enumerate() {
+                    a[i] = *v;
+                }
+                a
+            }),
         };
         tools::json_string(tools::tree_payload(
             &genome,
@@ -504,6 +545,10 @@ impl MoonvyServer {
             flatten: req.flatten,
             only: req.only,
             detect_duplicates: req.detect_duplicates,
+            deduplicate: req.deduplicate,
+            text_content: req.text_content.unwrap_or_default(),
+            node_id: req.node_id,
+            ..Default::default()
         };
         let tree = tools::tree_payload(&genome, None, &options, req.include_assets);
         let tokens = crate::genome::extract_tokens(&genome);
@@ -654,6 +699,10 @@ impl MoonvyServer {
             flatten: req.flatten,
             only: req.only,
             detect_duplicates: req.detect_duplicates,
+            deduplicate: req.deduplicate,
+            text_content: req.text_content.unwrap_or_default(),
+            node_id: req.node_id,
+            ..Default::default()
         };
         let tree = crate::genome::extract_tree(&genome, req.frame.as_deref(), &options);
         tools::json_string(json!({
@@ -697,7 +746,7 @@ impl MoonvyServer {
 
     #[tool(
         name = "moonvy_diff_designs",
-        description = "Compare two design URLs by node id (with same-name fallback) and return added/removed/changed layers with before/after snapshots - use this to see what differs between states (e.g. normal vs hover). Supports skipEmptyGroups, flatten, only."
+        description = "Compare two design URLs by node id (with same-name fallback). Returns { summary: {added,removed,changed,aNodes,bNodes}, added, removed, changed:[{id,name,fields}] } with before/after snapshots when withSnapshots. Coordinates are absolute by default (flatten). Supports skipEmptyGroups, only."
     )]
     async fn diff_designs(
         &self,
@@ -714,14 +763,53 @@ impl MoonvyServer {
             skip_empty_groups: req.skip_empty_groups,
             flatten: req.flatten,
             only: req.only,
+            text_content: crate::genome::TextContent::Truncate,
             ..Default::default()
         };
         let tree_a = crate::genome::extract_tree(&genome_a, req.frame.as_deref(), &options);
         let tree_b = crate::genome::extract_tree(&genome_b, req.frame.as_deref(), &options);
         let diff = crate::genome::diff_trees(&tree_a, &tree_b);
-        tools::json_string(
-            json!({ "added": diff.added, "removed": diff.removed, "changed": diff.changed }),
-        )
+        let a_nodes = crate::genome::count_nodes(&tree_a);
+        let b_nodes = crate::genome::count_nodes(&tree_b);
+        if !req.with_snapshots {
+            // Strip the (verbose) before/after snapshots from changed nodes.
+            let mut changed: Vec<Value> = Vec::with_capacity(diff.changed.len());
+            for c in &diff.changed {
+                changed.push(json!({
+                    "id": c.id,
+                    "name": c.name,
+                    "fields": c.fields,
+                }));
+            }
+            let mut payload = json!({
+                "summary": {
+                    "added": diff.added.len(),
+                    "removed": diff.removed.len(),
+                    "changed": diff.changed.len(),
+                    "aNodes": a_nodes,
+                    "bNodes": b_nodes,
+                },
+                "added": diff.added,
+                "removed": diff.removed,
+                "changed": changed,
+            });
+            tools::compact_numbers(&mut payload);
+            return tools::json_string(payload);
+        }
+        let mut payload = json!({
+            "summary": {
+                "added": diff.added.len(),
+                "removed": diff.removed.len(),
+                "changed": diff.changed.len(),
+                "aNodes": a_nodes,
+                "bNodes": b_nodes,
+            },
+            "added": diff.added,
+            "removed": diff.removed,
+            "changed": diff.changed,
+        });
+        tools::compact_numbers(&mut payload);
+        tools::json_string(payload)
     }
 }
 

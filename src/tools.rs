@@ -708,6 +708,32 @@ pub fn search_designs(
         .collect())
 }
 
+/// Rewrite whole-number floats as integers (16.0 -> 16) to shrink payloads.
+pub fn compact_numbers(value: &mut Value) {
+    match value {
+        Value::Number(n) => {
+            if let Some(f) = n.as_f64()
+                && f.fract() == 0.0
+                && f >= i64::MIN as f64
+                && f <= i64::MAX as f64
+            {
+                *value = Value::Number(serde_json::Number::from(f as i64));
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                compact_numbers(item);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                compact_numbers(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub fn tree_payload(
     genome: &Genome,
     frame: Option<&str>,
@@ -717,13 +743,39 @@ pub fn tree_payload(
     let tree = extract_tree(genome, frame, options);
     let mut payload = json!({ "items": tree });
     if include_assets {
+        // hash -> {url, type, refs:[nodeId...]}: deduplicated by content hash
+        // and annotated with every tree node that references the asset via
+        // its snapshotHash.
+        let mut refs: HashMap<String, Vec<String>> = HashMap::new();
+        let mut stack: Vec<&crate::genome::TreeNode> = tree.iter().collect();
+        while let Some(node) = stack.pop() {
+            if let Some(hash) = node.snapshot_hash.as_deref() {
+                refs.entry(hash.to_string()).or_default().push(node.id.clone());
+            }
+            if let Some(children) = &node.children {
+                stack.extend(children.iter());
+            }
+        }
         let assets: Vec<Value> = genome
             .images
             .iter()
             .take(50)
-            .map(|(hash, info)| json!({ "hash": hash, "url": info.url.clone().unwrap_or_default(), "type": info.r#type.clone() }))
+            .map(|(hash, info)| {
+                let mut entry = json!({
+                    "hash": hash,
+                    "url": info.url.clone().unwrap_or_default(),
+                    "type": info.r#type.clone(),
+                });
+                if let Some(node_ids) = refs.get(hash) {
+                    entry["refs"] = Value::Array(
+                        node_ids.iter().map(|id| Value::String(id.clone())).collect(),
+                    );
+                }
+                entry
+            })
             .collect();
         payload["assets"] = Value::Array(assets);
     }
+    compact_numbers(&mut payload);
     payload
 }
