@@ -1,4 +1,7 @@
 [package]
+repository = "https://github.com/kiko-love/openMoonvy-mcp-rs"
+license = "MIT"
+description = "Moonvy design extraction MCP server (Rust, pure API)"
 name = "openmoonvy-mcp-rs"
 version = "0.1.0"
 edition = "2024"
@@ -15,3 +18,8 @@ serde_json = "1.0.151"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
 url = "2.5.8"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
