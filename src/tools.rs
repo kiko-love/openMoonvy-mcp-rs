@@ -24,7 +24,7 @@ pub fn json_string(value: Value) -> Result<String, McpError> {
     serde_json::to_string(&value).map_err(tool_error)
 }
 
-/// Disk cache for genomes (mirrors the TypeScript version: ~/.moonvy-ai/genome-cache).
+/// Disk cache for genomes (~/.moonvy-ai/genome-cache, 5 min TTL).
 fn genome_cache_dir() -> PathBuf {
     std::env::var("MOONVY_CACHE_DIR")
         .map(PathBuf::from)

@@ -1,17 +1,18 @@
 # openMoonvy-mcp-rs
 
-**Moonvy 设计稿 → 前端代码的 MCP 服务器（Rust 版）**。纯 API 架构，单二进制分发，无需 Node.js。
-
-当前为 **PoC 阶段**：3 个核心工具已可用（真实 Moonvy API 实测通过）。
+**Moonvy 设计稿 → 前端代码的 MCP 服务器（Rust）**。纯 API 架构，单二进制分发，无需 Node.js、无浏览器运行时。
 
 ## 特性
 
 - 🚀 单二进制：编译后一个可执行文件，无运行时依赖
-- ⚡ 纯 API：Bearer token 直连 Moonvy，无浏览器、无 daemon
-- 🌳 输出降噪：`skipEmptyGroups`（丢弃空容器）、`flatten`（画板原点绝对坐标）、`only`（类型过滤）、`detectDuplicates`（重复标注）
-- 📐 强类型：serde 解析 genome，字段错误编译期发现
+- ⚡ 纯 API：Bearer token 直连 Moonvy（`global-api.moonvy.com`），无浏览器、无 daemon
+- 🌳 输出降噪：`skipEmptyGroups`（丢弃空容器）、`flatten`（画板原点绝对坐标）、`only`（类型/`image` 语义过滤）、`detectDuplicates`（重复标注）
+- 🎯 定向检索：`moonvy_find_node` 按名称/文本搜索节点，无需全树转储
+- 🔍 状态对比：`moonvy_diff_designs` 输出 added/removed/changed + before/after 快照，支持跨页面同名配对
+- 📐 强类型：serde 解析 genome（camelCase + borderRadius 数组兼容），字段错误编译期发现
+- 🗂️ 工作区索引：`.moonvy-mcp/catalog.json` 支持按名称/别名/标签检索设计
 
-## 安装与发布
+## 安装
 
 **GitHub Releases（推荐，单二进制）**：
 
@@ -30,40 +31,33 @@ irm https://github.com/kiko-love/openMoonvy-mcp-rs/releases/latest/download/open
 cargo install openmoonvy-mcp-rs
 ```
 
-**发布流程**（cargo-dist 自动）：`git tag vX.Y.Z && git push origin vX.Y.Z` → GitHub Actions 构建 5 平台 → 上传 Release + 安装脚本。
-
-## 工具（12 个，与 TypeScript 版行为对齐）
+## 工具（14 个）
 
 | 工具 | 说明 |
 |---|---|
 | `moonvy_get_design` | 设计元数据（标题、画框尺寸） |
+| `moonvy_get_design_context` | 一次返回 元数据+图层树+Token（聚合入口） |
 | `moonvy_get_tree` | 图层树：`withStyle` / `skipEmptyGroups` / `flatten` / `only` / `detectDuplicates` / `includeAssets` |
-| `moonvy_extract_tokens` | 设计 Token（colors/fontSizes/radii/spacing） |
+| `moonvy_get_tree_by_name` | 按名称取图层树（基于 catalog 索引） |
+| `moonvy_find_node` | 按名称/文本子串搜索节点（id/bbox/text） |
 | `moonvy_list_pages` | 项目文件列表（分页 BFS，含 preview 缩略图） |
 | `moonvy_list_layers` | 扁平图层列表（找节点 ID） |
-| `moonvy_get_node_style` | 单节点样式（含 strokeWidth/strokeColor/gradient） |
-| `moonvy_get_design_context` | 一次返回 元数据+图层树+Token（聚合入口） |
-| `moonvy_download_asset` | 下载切图/快照/图片填充 |
+| `moonvy_get_node_style` | 单节点样式（strokeWidth/strokeColor/gradient/字重映射） |
+| `moonvy_extract_tokens` | 设计 Token（colors/fontSizes/radii/spacing） |
+| `moonvy_get_asset_url` | 资产直链（slice/snapshot/image，不落盘） |
+| `moonvy_download_asset` | 下载切图/快照/图片填充到本地 |
+| `moonvy_diff_designs` | 对比两个设计（added/removed/changed + before/after） |
 | `moonvy_sync_project` | 扫描项目写入 `.moonvy-mcp/catalog.json` 索引 |
 | `moonvy_search_designs` | 按名称/别名/标签检索索引 |
-| `moonvy_get_tree_by_name` | 按名称取图层树 |
-| `moonvy_diff_designs` | 对比两个设计（added/removed/changed） |
+| `moonvy_set_token` / `moonvy_login` | 保存 token / 浏览器引导登录 |
 
-## 构建
+## 快速上手
 
-```bash
-cargo build --release
-# 产物：target/release/openmoonvy-mcp-rs(.exe)
-```
-
-## 配置 token
-
-优先级：`MOONVY_TOKEN` 环境变量 > `~/.moonvy-ai/token.json`
-
-```bash
-export MOONVY_TOKEN="<JWT>"          # 或
-mkdir -p ~/.moonvy-ai && # 写入 token.json: {"token":"<JWT>", ...}
-```
+1. **登录**：在 MCP 客户端中调用 `moonvy_login`（自动打开浏览器登录并保存 token），或设置 `MOONVY_TOKEN` 环境变量。
+2. **（可选）索引项目**：调用 `moonvy_sync_project`（workspaceDir 为前端项目根目录），之后可按设计名称直接取树。
+3. **获取设计**：调用 `moonvy_get_design_context`（URL 传 `https://moonvy.com/project/...` 目录或具体设计文件 URL），一次拿到元数据 + 图层树 + Token。
+4. **降噪还原**：`moonvy_get_tree` 带 `skipEmptyGroups` + `flatten` + `detectDuplicates`；找特定元素用 `moonvy_find_node`；取图用 `moonvy_get_asset_url` / `moonvy_download_asset`。
+5. **对比状态**：`moonvy_diff_designs` 对比普通态与 hover 态两个设计，直接输出变更图层。
 
 ## 配置 MCP（opencode / Claude Code / Cursor）
 
@@ -73,10 +67,23 @@ mkdir -p ~/.moonvy-ai && # 写入 token.json: {"token":"<JWT>", ...}
     "moonvy": {
       "type": "local",
       "command": ["/absolute/path/to/openmoonvy-mcp-rs"],
-      "enabled": true
+      "enabled": true,
+      "environment": {
+        "MOONVY_WORKSPACE_DIR": "/path/to/frontend"
+      }
     }
   }
 }
+```
+
+`MOONVY_WORKSPACE_DIR`（可选）启用 catalog/aliases 资源与 workspace 自动补全。
+
+## 构建与测试
+
+```bash
+cargo build --release          # 产物：target/release/openmoonvy-mcp-rs(.exe)
+cargo test                     # 27 个单元测试（serde 解析/树选项/diff/token）
+cargo test -- --ignored --nocapture real_api_smoke   # 真实 Moonvy API 端到端实测
 ```
 
 ## 架构
@@ -84,23 +91,18 @@ mkdir -p ~/.moonvy-ai && # 写入 token.json: {"token":"<JWT>", ...}
 ```
 src/
 ├── main.rs     # stdio 入口（rmcp 官方 Rust SDK）
-├── server.rs   # MCP 工具注册与 schema（#[tool_router] 宏）
-├── tools.rs    # 业务逻辑（分页/资产/catalog）
-├── api.rs      # Moonvy API 客户端（reqwest + gzip）
-├── genome.rs   # genome 解析（树/样式/token/diff，纯函数）
+├── server.rs   # MCP 工具注册与 schema（#[tool_router] 宏）+ resources/prompts
+├── tools.rs    # 业务逻辑（分页/资产解析与下载/catalog 同步）
+├── api.rs      # Moonvy API 客户端（reqwest + gzip + 缓存）
+├── genome.rs   # genome 解析（树/样式/token/diff/搜索，纯函数）
 ├── catalog.rs  # workspace 索引（catalog.json + 检索）
-└── token.rs    # token 加载
+├── token.rs    # token 加载与 JWT 过期解析
+└── login.rs    # 引导登录（CDP 捕获 token）
 ```
 
-行为契约与 TypeScript 版（moonvy-ai）对齐：相同的节点结构、样式归一化、树选项语义、catalog 检索排序。
+## 发布流程
 
-## 路线图
-
-- [x] 全量工具移植（12 个，真实 API 实测通过）
-- [ ] 自动登录（浏览器 CDP）
-- [ ] cargo-dist 发布（GitHub Releases + Homebrew + crates.io）
-- [ ] Rust 单元测试
-- [ ] 目录 URL 自动解析（当前需文件 URL）
+cargo-dist 自动构建：`git tag vX.Y.Z && git push origin vX.Y.Z` → GitHub Actions 构建 5 平台 → 上传 Release + 安装脚本；另可用 `cargo publish --registry crates-io` 发布到 crates.io。
 
 ## License
 

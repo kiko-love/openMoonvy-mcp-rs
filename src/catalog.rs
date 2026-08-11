@@ -1,6 +1,6 @@
 /*
  * Frontend workspace catalog: .moonvy-mcp/catalog.json + aliases.json
- * and name-based search (ported from the TypeScript version).
+ * and name-based search.
  */
 
 use anyhow::Context;

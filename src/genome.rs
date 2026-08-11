@@ -1,9 +1,8 @@
 ﻿/*
  * Moonvy genome data structures and parsing.
  *
- * Mirrors the design/behavior contract of the TypeScript version
- * (moonvy-ai): same node shapes, same style normalization, same
- * tree options (skipEmptyGroups / flatten / only / detectDuplicates).
+ * Node shapes, style normalization and tree options
+ * (skipEmptyGroups / flatten / only / detectDuplicates).
  */
 
 use serde::{Deserialize, Serialize};
