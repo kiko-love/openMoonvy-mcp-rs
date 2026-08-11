@@ -11,6 +11,27 @@
 - 🌳 输出降噪：`skipEmptyGroups`（丢弃空容器）、`flatten`（画板原点绝对坐标）、`only`（类型过滤）、`detectDuplicates`（重复标注）
 - 📐 强类型：serde 解析 genome，字段错误编译期发现
 
+## 安装与发布
+
+**GitHub Releases（推荐，单二进制）**：
+
+```bash
+# macOS / Linux
+curl -LsSf https://github.com/kiko-love/openMoonvy-mcp-rs/releases/latest/download/openmoonvy-mcp-rs-installer.sh | sh
+# Windows (PowerShell)
+irm https://github.com/kiko-love/openMoonvy-mcp-rs/releases/latest/download/openmoonvy-mcp-rs-installer.ps1 | iex
+```
+
+自动下载对应平台二进制（Windows/macOS/Linux × x86_64/arm64），带 sha256 校验。
+
+**crates.io（开发者）**：
+
+```bash
+cargo install openmoonvy-mcp-rs
+```
+
+**发布流程**（cargo-dist 自动）：`git tag vX.Y.Z && git push origin vX.Y.Z` → GitHub Actions 构建 5 平台 → 上传 Release + 安装脚本。
+
 ## 工具（12 个，与 TypeScript 版行为对齐）
 
 | 工具 | 说明 |
