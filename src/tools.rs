@@ -1,4 +1,4 @@
-/**
+/*
  * Shared tool logic: page listing, asset download, catalog sync, helpers.
  */
 
@@ -8,12 +8,12 @@ use std::path::PathBuf;
 use rmcp::ErrorData as McpError;
 use serde_json::{Value, json};
 
-use crate::api::{MoonvyApi, MoonvyNode, parse_moonvy_url, MoonvyUrl};
-use crate::catalog::{Catalog, CatalogDesign, design_summary, search_catalog};
-use crate::genome::{Genome, TreeOptions, extract_tree, find_node};
+use crate::api::{MoonvyApi, MoonvyNode, MoonvyUrl, parse_moonvy_url};
+use crate::catalog::{Catalog, CatalogDesign, search_catalog};
+use crate::genome::{Genome, GenomeNode, TreeOptions, extract_tree, find_node};
 
 pub fn tool_error<E: std::fmt::Display>(error: E) -> McpError {
-    McpError::internal_error(error.to_string(), None)
+    McpError::internal_error(format!("[moonvy_error] {error}"), None)
 }
 
 pub fn parse_ids(url: &str) -> anyhow::Result<MoonvyUrl> {
@@ -24,10 +24,79 @@ pub fn json_string(value: Value) -> Result<String, McpError> {
     serde_json::to_string(&value).map_err(tool_error)
 }
 
+/// Disk cache for genomes (mirrors the TypeScript version: ~/.moonvy-ai/genome-cache).
+fn genome_cache_dir() -> PathBuf {
+    std::env::var("MOONVY_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+            home.join(".moonvy-ai").join("genome-cache")
+        })
+}
+
+const GENOME_CACHE_TTL_MS: u128 = 5 * 60 * 1000;
+
+fn read_genome_cache(key: &str) -> Option<Genome> {
+    let path = genome_cache_dir().join(format!("{key}.json"));
+    let meta = std::fs::metadata(&path).ok()?;
+    let modified = meta.modified().ok()?;
+    if std::time::SystemTime::now()
+        .duration_since(modified)
+        .ok()?
+        .as_millis()
+        > GENOME_CACHE_TTL_MS
+    {
+        return None;
+    }
+    let cached: Genome = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())?;
+    // Reject caches written by older schema versions (e.g. snake_case
+    // serialization) that deserialize into an empty genome without error.
+    if cached.pages.is_empty() && cached.images.is_empty() {
+        return None;
+    }
+    Some(cached)
+}
+
+fn write_genome_cache(key: &str, genome: &Genome) {
+    let dir = genome_cache_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    if let Ok(json) = serde_json::to_string(genome) {
+        let _ = std::fs::write(dir.join(format!("{key}.json")), json);
+    }
+}
+
+/// Auto-correct a project-directory URL to a concrete design file URL.
+async fn resolve_design_url(api: &MoonvyApi, url: &str) -> anyhow::Result<String> {
+    let ids = parse_ids(url)?;
+    if ids.file_id.is_some() {
+        return Ok(url.to_string());
+    }
+    let rows = list_pages(api, url, 20, 5).await?;
+    let design = rows
+        .iter()
+        .find(|r| r.r#type == "design" && !r.url.is_empty());
+    match design {
+        Some(d) => Ok(d.url.clone()),
+        None => anyhow::bail!("Project directory has no design files"),
+    }
+}
 
 pub async fn genome_for_url(api: &MoonvyApi, url: &str) -> anyhow::Result<(MoonvyUrl, Genome)> {
-    let ids = parse_ids(url)?;
-    let node_id = ids.file_id.clone().or_else(|| ids.dir_id.clone()).ok_or_else(|| anyhow::anyhow!("No file or directory ID in URL"))?;
+    let url = resolve_design_url(api, url).await?;
+    let ids = parse_ids(&url)?;
+    let node_id = ids
+        .file_id
+        .clone()
+        .or_else(|| ids.dir_id.clone())
+        .ok_or_else(|| anyhow::anyhow!("No file or directory ID in URL"))?;
+
+    if let Some(cached) = read_genome_cache(&node_id) {
+        return Ok((ids, cached));
+    }
     let node = api.get_node(&ids.project_id, &node_id, "full").await?;
     let genome_url = node
         .files
@@ -36,6 +105,7 @@ pub async fn genome_for_url(api: &MoonvyApi, url: &str) -> anyhow::Result<(Moonv
         .and_then(|g| g.url.clone())
         .ok_or_else(|| anyhow::anyhow!("No genome file found for node \"{node_id}\""))?;
     let genome = api.fetch_genome(&genome_url).await?;
+    write_genome_cache(&node_id, &genome);
     Ok((ids, genome))
 }
 
@@ -59,7 +129,8 @@ pub fn sanitize_url(url: &str) -> String {
 pub fn sanitize_name(name: &str) -> String {
     name.chars()
         .map(|c| {
-            if c.is_alphanumeric() || c == '_' || c == '-' || ('\u{4e00}'..='\u{9fff}').contains(&c) {
+            if c.is_alphanumeric() || c == '_' || c == '-' || ('\u{4e00}'..='\u{9fff}').contains(&c)
+            {
                 c
             } else {
                 '_'
@@ -101,10 +172,10 @@ pub struct PagePreview {
 
 fn pick_string(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<String> {
     for key in keys {
-        if let Some(Value::String(s)) = obj.get(*key) {
-            if !s.is_empty() {
-                return Some(s.clone());
-            }
+        if let Some(Value::String(s)) = obj.get(*key)
+            && !s.is_empty()
+        {
+            return Some(s.clone());
         }
     }
     None
@@ -116,7 +187,11 @@ fn extract_items(response: &Value) -> Vec<&Value> {
         match value {
             Value::Array(items) => return items.iter().collect(),
             Value::Object(map) => {
-                if let Some(candidate) = map.get("data").or_else(|| map.get("result")).or_else(|| map.get("list")) {
+                if let Some(candidate) = map
+                    .get("data")
+                    .or_else(|| map.get("result"))
+                    .or_else(|| map.get("list"))
+                {
                     stack.push(candidate);
                 }
             }
@@ -126,51 +201,64 @@ fn extract_items(response: &Value) -> Vec<&Value> {
     Vec::new()
 }
 
-fn get_number(response: &Value, keys: &[&str]) -> Option<i64> {
-    let mut stack: Vec<&Value> = vec![response];
-    while let Some(v) = stack.pop() {
-        if let Some(n) = v.as_i64() {
-            return Some(n);
-        }
-        if let Some(map) = v.as_object() {
-            for key in keys {
-                if let Some(next) = map.get(*key) {
-                    stack.push(next);
-                }
-            }
-        }
-    }
-    None
+/// Pagination metadata pulled from a list response in one pass:
+/// total, hasNext/hasMore, pageSize/limit, and the collected list length.
+struct Pagination {
+    total: Option<i64>,
+    has_next: Option<bool>,
+    page_size: Option<i64>,
+    length: Option<i64>,
 }
 
-fn is_last_page(response: &Value, collected: usize) -> bool {
+fn pagination_meta(response: &Value, collected: usize) -> Pagination {
+    let mut meta = Pagination {
+        total: None,
+        has_next: None,
+        page_size: None,
+        length: None,
+    };
     let mut stack: Vec<&Value> = vec![response];
-    let mut has_next: Option<bool> = None;
     while let Some(v) = stack.pop() {
-        if let Some(b) = v.as_bool() {
-            has_next = Some(b);
-            break;
-        }
-        if let Some(map) = v.as_object() {
-            for key in ["hasNext", "hasMore"] {
-                if let Some(next) = map.get(key) {
-                    stack.push(next);
+        match v {
+            Value::Number(n) => {
+                if meta.total.is_none() && n.is_i64() {
+                    meta.total = n.as_i64();
                 }
             }
+            Value::Bool(b) => {
+                if meta.has_next.is_none() {
+                    meta.has_next = Some(*b);
+                }
+            }
+            Value::Object(map) => {
+                for (key, value) in map {
+                    match key.as_str() {
+                        "total" => meta.total = value.as_i64(),
+                        "hasNext" | "hasMore" => meta.has_next = value.as_bool(),
+                        "pageSize" | "limit" => meta.page_size = value.as_i64(),
+                        "length" => meta.length = value.as_i64(),
+                        "data" | "result" | "list" => stack.push(value),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
         }
     }
-    if has_next == Some(false) {
-        return true;
+    if meta.length.is_none() {
+        meta.length = Some(collected as i64);
     }
-    if let Some(total) = get_number(response, &["total"]) {
-        if collected as i64 >= total {
-            return true;
-        }
-    }
-    match (get_number(response, &["pageSize", "limit"]), get_number(response, &["length"])) {
-        (Some(size), Some(len)) => len < size,
-        _ => false,
-    }
+    meta
+}
+
+fn is_last_page(meta: &Pagination) -> bool {
+    meta.has_next == Some(false)
+        || meta
+            .total
+            .is_some_and(|total| meta.length.is_some_and(|len| len >= total))
+        || meta
+            .page_size
+            .is_some_and(|size| meta.length.is_some_and(|len| len < size))
 }
 
 fn normalize_item(item: &Value, project_id: &str, input_dir_id: Option<&str>) -> Option<PageRow> {
@@ -190,18 +278,29 @@ fn normalize_item(item: &Value, project_id: &str, input_dir_id: Option<&str>) ->
         let normal = pick_string(preview, &["normal"]);
         let large = pick_string(preview, &["large"]);
         if normal.is_some() || large.is_some() {
-            return Some(PageRow { preview: Some(PagePreview { normal, large }), ..row });
+            return Some(PageRow {
+                preview: Some(PagePreview { normal, large }),
+                ..row
+            });
         }
     }
     Some(row)
 }
 
 fn can_have_children(row_type: &str) -> bool {
-    matches!(row_type.to_lowercase().as_str(), "any" | "dir" | "directory" | "folder")
+    matches!(
+        row_type.to_lowercase().as_str(),
+        "any" | "dir" | "directory" | "folder"
+    )
 }
 
 /// Paginated BFS listing of a project directory.
-pub async fn list_pages(api: &MoonvyApi, url: &str, limit: u32, max_pages: u32) -> anyhow::Result<Vec<PageRow>> {
+pub async fn list_pages(
+    api: &MoonvyApi,
+    url: &str,
+    limit: u32,
+    max_pages: u32,
+) -> anyhow::Result<Vec<PageRow>> {
     let ids = parse_ids(url)?;
     let mut rows: Vec<PageRow> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -219,7 +318,9 @@ pub async fn list_pages(api: &MoonvyApi, url: &str, limit: u32, max_pages: u32) 
                 break;
             }
             scanned_pages += 1;
-            let response = api.list_nodes(&ids.project_id, page_index, scope_id.as_deref()).await?;
+            let response = api
+                .list_nodes(&ids.project_id, page_index, scope_id.as_deref())
+                .await?;
             let items = extract_items(&response);
             if items.is_empty() {
                 break;
@@ -238,7 +339,8 @@ pub async fn list_pages(api: &MoonvyApi, url: &str, limit: u32, max_pages: u32) 
                     }
                 }
             }
-            if is_last_page(&response, rows.len()) {
+            let meta = pagination_meta(&response, rows.len());
+            if is_last_page(&meta) {
                 break;
             }
         }
@@ -248,46 +350,93 @@ pub async fn list_pages(api: &MoonvyApi, url: &str, limit: u32, max_pages: u32) 
 
 /* -------------------------------- asset ------------------------------------ */
 
-fn resolve_asset_url(hash: &str, assets: &serde_json::Map<String, Value>, genome: &Genome) -> String {
-    if let Some(Value::String(url)) = assets.get(hash) {
-        if !url.is_empty() {
-            return url.clone();
-        }
+fn resolve_asset_url(
+    hash: &str,
+    assets: &serde_json::Map<String, Value>,
+    genome: &Genome,
+) -> String {
+    if let Some(Value::String(url)) = assets.get(hash)
+        && !url.is_empty()
+    {
+        return url.clone();
     }
-    genome.images.get(hash).and_then(|i| i.url.clone()).unwrap_or_else(|| format!("https://fs.moonvy.com/{hash}"))
+    genome
+        .images
+        .get(hash)
+        .and_then(|i| i.url.clone())
+        .unwrap_or_else(|| format!("https://fs.moonvy.com/{hash}"))
 }
 
-fn find_parent_of<'a>(node: &'a crate::genome::GenomeNode, target_id: &str) -> Option<&'a crate::genome::GenomeNode> {
-    for child in &node.children {
-        if crate::genome::ids_equal(child.id.as_deref(), Some(target_id)) {
-            return Some(node);
-        }
-        if let Some(found) = find_parent_of(child, target_id) {
-            return Some(found);
+/// id (or any of its `;`-separated segments) -> parent node, built once.
+fn parent_index(genome: &Genome) -> HashMap<String, &GenomeNode> {
+    fn walk<'a>(node: &'a GenomeNode, out: &mut HashMap<String, &'a GenomeNode>) {
+        for child in &node.children {
+            if let Some(id) = &child.id {
+                for segment in id.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                    out.insert(segment.to_string(), node);
+                }
+            }
+            walk(child, out);
         }
     }
-    None
+    let mut index = HashMap::new();
+    for page in &genome.pages {
+        walk(page, &mut index);
+    }
+    index
 }
 
-fn find_parent_snapshot(genome: &Genome, layer: &crate::genome::GenomeNode) -> Option<(String, Option<String>)> {
-    let layer_id = layer.id.clone()?;
-    let mut current = genome.pages.iter().find_map(|page| find_parent_of(page, &layer_id));
-    let mut seen = HashSet::new();
+fn lookup_parent<'a>(
+    index: &'a HashMap<String, &'a GenomeNode>,
+    id: &str,
+) -> Option<&'a GenomeNode> {
+    index.get(id).copied().or_else(|| {
+        id.split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .find_map(|s| index.get(s).copied())
+    })
+}
+
+/// Walk up the ancestor chain and return the first snapshot (hash, name).
+fn find_parent_snapshot(genome: &Genome, layer_id: &str) -> Option<(String, Option<String>)> {
+    let index = parent_index(genome);
+    let mut current = lookup_parent(&index, layer_id);
+    let mut seen: HashSet<String> = HashSet::new();
     while let Some(node) = current {
-        if !seen.insert(node.id.clone().unwrap_or_default()) {
+        let Some(id) = node.id.clone() else { break };
+        if !seen.insert(id.clone()) {
             break;
         }
-        if let Some(snapshot) = node.snapshot.clone().or_else(|| node.snapshot_preview.clone()) {
+        if let Some(snapshot) = node
+            .snapshot
+            .clone()
+            .or_else(|| node.snapshot_preview.clone())
+        {
             return Some((snapshot, node.name.clone()));
         }
-        let id = node.id.clone()?;
-        current = genome.pages.iter().find_map(|page| find_parent_of(page, &id));
+        current = lookup_parent(&index, &id);
     }
     None
 }
 
-/// Download a slice/snapshot/image from a Moonvy node; returns (path, size, name, url).
-pub async fn download_asset(api: &MoonvyApi, url: &str, node: &str, r#type: Option<&str>, slice_format: Option<&str>, name: Option<&str>, out: Option<&str>) -> anyhow::Result<(PathBuf, u64, String, String)> {
+/// Resolved asset: download URL plus a display name and file extension.
+pub struct ResolvedAsset {
+    pub url: String,
+    pub name: String,
+    pub extension: String,
+}
+
+/// Resolve the download URL of a slice/snapshot/image from a Moonvy node
+/// without fetching the bytes. Shared by moonvy_download_asset (which then
+/// downloads and persists) and moonvy_get_asset_url (URL-only).
+pub async fn resolve_asset(
+    api: &MoonvyApi,
+    url: &str,
+    node: &str,
+    r#type: Option<&str>,
+    slice_format: Option<&str>,
+) -> anyhow::Result<ResolvedAsset> {
     let ids = parse_ids(url)?;
     let mut download_url: Option<String> = None;
     let mut fallback_name = "asset".to_string();
@@ -295,10 +444,27 @@ pub async fn download_asset(api: &MoonvyApi, url: &str, node: &str, r#type: Opti
 
     if let Some(file_id) = &ids.file_id {
         let file_node = api.get_node(&ids.project_id, file_id, "full").await?;
-        let assets: serde_json::Map<String, Value> = file_node.meta.as_ref().and_then(|m| m.assets.clone()).unwrap_or_default();
-        let genome = api.fetch_genome(&file_node.files.as_ref().and_then(|f| f.genome.as_ref()).and_then(|g| g.url.clone()).ok_or_else(|| anyhow::anyhow!("No genome file found"))?).await?;
+        let assets: serde_json::Map<String, Value> = file_node
+            .meta
+            .as_ref()
+            .and_then(|m| m.assets.clone())
+            .unwrap_or_default();
+        let genome = api
+            .fetch_genome(
+                &file_node
+                    .files
+                    .as_ref()
+                    .and_then(|f| f.genome.as_ref())
+                    .and_then(|g| g.url.clone())
+                    .ok_or_else(|| anyhow::anyhow!("No genome file found"))?,
+            )
+            .await?;
 
-        let layer = genome.pages.iter().find_map(|page| find_node(page, node)).cloned();
+        let layer = genome
+            .pages
+            .iter()
+            .find_map(|page| find_node(page, node))
+            .cloned();
         if let Some(layer) = layer {
             fallback_name = layer.name.clone().unwrap_or_else(|| "unnamed".to_string());
             let resolved_type = r#type.map(str::to_string).unwrap_or_else(|| {
@@ -306,7 +472,11 @@ pub async fn download_asset(api: &MoonvyApi, url: &str, node: &str, r#type: Opti
                     "slice".to_string()
                 } else if layer.snapshot.is_some() {
                     "snapshot".to_string()
-                } else if layer.fills.iter().any(|f| f.r#type.as_deref() == Some("image")) {
+                } else if layer
+                    .fills
+                    .iter()
+                    .any(|f| f.r#type.as_deref() == Some("image"))
+                {
                     "image".to_string()
                 } else {
                     "snapshot".to_string()
@@ -315,7 +485,11 @@ pub async fn download_asset(api: &MoonvyApi, url: &str, node: &str, r#type: Opti
 
             match resolved_type.as_str() {
                 "slice" => {
-                    let slices = layer.slices.as_ref().and_then(|s| s.as_object()).ok_or_else(|| anyhow::anyhow!("Node does not have slices."))?;
+                    let slices = layer
+                        .slices
+                        .as_ref()
+                        .and_then(|s| s.as_object())
+                        .ok_or_else(|| anyhow::anyhow!("Node does not have slices."))?;
                     let format = slice_format.unwrap_or("svg");
                     let slice_info = slices
                         .get(format)
@@ -324,31 +498,59 @@ pub async fn download_asset(api: &MoonvyApi, url: &str, node: &str, r#type: Opti
                         .and_then(|s| s.as_object())
                         .and_then(|o| o.get("id"))
                         .and_then(|v| v.as_str());
-                    let hash = slice_info.map(str::to_string).ok_or_else(|| anyhow::anyhow!("Format \"{format}\" not found on slice."))?;
+                    let hash = slice_info.map(str::to_string).ok_or_else(|| {
+                        anyhow::anyhow!("Format \"{format}\" not found on slice.")
+                    })?;
                     download_url = Some(resolve_asset_url(&hash, &assets, &genome));
-                    asset_extension = if format == "svg" { ".svg".to_string() } else { ".png".to_string() };
+                    asset_extension = if format == "svg" {
+                        ".svg".to_string()
+                    } else {
+                        ".png".to_string()
+                    };
                 }
                 "snapshot" => {
-                    let mut hash = layer.snapshot.clone().or_else(|| layer.snapshot_preview.clone());
-                    if hash.is_none() {
-                        if let Some((parent_hash, parent_name)) = find_parent_snapshot(&genome, &layer) {
-                            hash = Some(parent_hash);
-                            if let Some(parent_name) = parent_name {
-                                fallback_name = parent_name;
-                            }
+                    let mut hash = layer
+                        .snapshot
+                        .clone()
+                        .or_else(|| layer.snapshot_preview.clone());
+                    if hash.is_none()
+                        && let Some(layer_id) = layer.id.as_deref()
+                        && let Some((parent_hash, parent_name)) =
+                            find_parent_snapshot(&genome, layer_id)
+                    {
+                        hash = Some(parent_hash);
+                        if let Some(parent_name) = parent_name {
+                            fallback_name = parent_name;
                         }
                     }
-                    let hash = hash.ok_or_else(|| anyhow::anyhow!("No snapshot found for this node or its parents."))?;
+                    let hash = hash.ok_or_else(|| {
+                        anyhow::anyhow!("No snapshot found for this node or its parents.")
+                    })?;
                     download_url = Some(resolve_asset_url(&hash, &assets, &genome));
                     asset_extension = ".png".to_string();
                 }
                 "image" => {
-                    let image_fill = layer.fills.iter().find(|f| f.r#type.as_deref() == Some("image"));
+                    let image_fill = layer
+                        .fills
+                        .iter()
+                        .find(|f| f.r#type.as_deref() == Some("image"));
                     let hash = image_fill
-                        .and_then(|f| f.image_hash.clone().or_else(|| f.id.clone()).or_else(|| f.hash.clone()))
-                        .ok_or_else(|| anyhow::anyhow!("Image fill does not have a valid asset reference."))?;
+                        .and_then(|f| {
+                            f.image_hash
+                                .clone()
+                                .or_else(|| f.id.clone())
+                                .or_else(|| f.hash.clone())
+                        })
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Image fill does not have a valid asset reference.")
+                        })?;
                     download_url = Some(resolve_asset_url(&hash, &assets, &genome));
-                    asset_extension = genome.images.get(&hash).and_then(|i| i.r#type.clone()).map(|t| format!(".{t}")).unwrap_or_else(|| ".png".to_string());
+                    asset_extension = genome
+                        .images
+                        .get(&hash)
+                        .and_then(|i| i.r#type.clone())
+                        .map(|t| format!(".{t}"))
+                        .unwrap_or_else(|| ".png".to_string());
                 }
                 other => anyhow::bail!("Invalid type: {other}"),
             }
@@ -357,23 +559,57 @@ pub async fn download_asset(api: &MoonvyApi, url: &str, node: &str, r#type: Opti
 
     if download_url.is_none() {
         let node_info: MoonvyNode = api.get_node(&ids.project_id, node, "full").await?;
-        fallback_name = node_info.name.clone().unwrap_or_else(|| "unnamed".to_string());
+        fallback_name = node_info
+            .name
+            .clone()
+            .unwrap_or_else(|| "unnamed".to_string());
         download_url = if r#type == Some("snapshot") {
-            node_info.preview.as_ref().and_then(|p| p.large.clone().or_else(|| p.normal.clone()))
+            node_info
+                .preview
+                .as_ref()
+                .and_then(|p| p.large.clone().or_else(|| p.normal.clone()))
         } else {
-            node_info.files.as_ref().and_then(|f| f.file.as_ref()).and_then(|f| f.url.clone())
-                .or_else(|| node_info.preview.as_ref().and_then(|p| p.large.clone().or_else(|| p.normal.clone())))
+            node_info
+                .files
+                .as_ref()
+                .and_then(|f| f.file.as_ref())
+                .and_then(|f| f.url.clone())
+                .or_else(|| {
+                    node_info
+                        .preview
+                        .as_ref()
+                        .and_then(|p| p.large.clone().or_else(|| p.normal.clone()))
+                })
         };
-        let url = download_url.ok_or_else(|| anyhow::anyhow!("Node does not have any downloadable asset or preview."))?;
+        let url = download_url.ok_or_else(|| {
+            anyhow::anyhow!("Node does not have any downloadable asset or preview.")
+        })?;
         download_url = Some(url);
     }
 
     let url = download_url.ok_or_else(|| anyhow::anyhow!("No download URL resolved"))?;
-    let bytes = api.download_file(&url).await?;
-
     if asset_extension.is_empty() {
         asset_extension = infer_extension(&url);
     }
+    Ok(ResolvedAsset {
+        url,
+        name: fallback_name,
+        extension: asset_extension,
+    })
+}
+
+/// Download a slice/snapshot/image from a Moonvy node; returns (path, size, name, url).
+pub async fn download_asset(
+    api: &MoonvyApi,
+    url: &str,
+    node: &str,
+    r#type: Option<&str>,
+    slice_format: Option<&str>,
+    name: Option<&str>,
+    out: Option<&str>,
+) -> anyhow::Result<(PathBuf, u64, String, String)> {
+    let resolved = resolve_asset(api, url, node, r#type, slice_format).await?;
+    let bytes = api.download_file(&resolved.url).await?;
 
     let out_path = PathBuf::from(out.unwrap_or("."));
     if !out_path.is_absolute() {
@@ -382,32 +618,61 @@ pub async fn download_asset(api: &MoonvyApi, url: &str, node: &str, r#type: Opti
     let (out_dir, file_name) = if out_path.is_dir() {
         (out_path, None)
     } else if out_path.extension().is_some() {
-        let parent = out_path.parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-        (parent, Some(out_path.file_name().unwrap_or_default().to_string_lossy().to_string()))
+        let parent = out_path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        (
+            parent,
+            Some(
+                out_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+        )
     } else {
         (out_path, None)
     };
     std::fs::create_dir_all(&out_dir)?;
-    let base_name = name.unwrap_or(&fallback_name).to_string();
-    let final_name = file_name.unwrap_or_else(|| format!("{}{}", sanitize_name(&base_name), asset_extension));
+    let base_name = name.unwrap_or(&resolved.name).to_string();
+    let final_name =
+        file_name.unwrap_or_else(|| format!("{}{}", sanitize_name(&base_name), resolved.extension));
     let save_path = out_dir.join(&final_name);
     std::fs::write(&save_path, &bytes)?;
-    Ok((save_path, bytes.len() as u64, final_name, url))
+    Ok((save_path, bytes.len() as u64, final_name, resolved.url))
 }
 
 /* -------------------------------- catalog ---------------------------------- */
 
 /// Build catalog designs from a page listing (type filter + previous alias/tag preservation).
-pub fn normalize_catalog_designs(rows: &[PageRow], include_types: &[String], previous: &Catalog, now: &str) -> Vec<CatalogDesign> {
+pub fn normalize_catalog_designs(
+    rows: &[PageRow],
+    include_types: &[String],
+    previous: &Catalog,
+    now: &str,
+) -> Vec<CatalogDesign> {
     let previous_index: HashMap<String, CatalogDesign> = previous
         .designs
         .iter()
-        .flat_map(|d| vec![(d.id.clone(), d.clone()), (d.url.clone(), d.clone()), (d.name.clone(), d.clone())])
+        .flat_map(|d| {
+            vec![
+                (d.id.clone(), d.clone()),
+                (d.url.clone(), d.clone()),
+                (d.name.clone(), d.clone()),
+            ]
+        })
         .collect();
     rows.iter()
-        .filter(|row| include_types.is_empty() || include_types.contains(&row.r#type.to_lowercase()))
+        .filter(|row| {
+            include_types.is_empty() || include_types.contains(&row.r#type.to_lowercase())
+        })
         .map(|row| {
-            let prev = previous_index.get(&row.id).or_else(|| previous_index.get(&row.url)).or_else(|| previous_index.get(&row.name));
+            let prev = previous_index
+                .get(&row.id)
+                .or_else(|| previous_index.get(&row.url))
+                .or_else(|| previous_index.get(&row.name));
             CatalogDesign {
                 id: row.id.clone(),
                 name: row.name.clone(),
@@ -424,21 +689,31 @@ pub fn normalize_catalog_designs(rows: &[PageRow], include_types: &[String], pre
         .collect()
 }
 
-pub fn search_designs(workspace: &std::path::Path, query: &str, limit: u32) -> anyhow::Result<Vec<Value>> {
+pub fn search_designs(
+    workspace: &std::path::Path,
+    query: &str,
+    limit: u32,
+) -> anyhow::Result<Vec<Value>> {
     let catalog = Catalog::load(workspace)?;
-    let aliases: HashMap<String, Value> = std::fs::read_to_string(workspace.join(crate::catalog::MOONVY_DIR).join("aliases.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default();
+    let aliases: HashMap<String, Value> =
+        std::fs::read_to_string(crate::catalog::artifact_path(workspace, "aliases"))
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
     let matches = search_catalog(&catalog, &aliases, query);
-    Ok(matches.into_iter().take(limit as usize).map(|m| serde_json::to_value(m).unwrap_or(Value::Null)).collect())
+    Ok(matches
+        .into_iter()
+        .take(limit as usize)
+        .map(|m| serde_json::to_value(m).unwrap_or(Value::Null))
+        .collect())
 }
 
-pub fn design_summary_json(design: &CatalogDesign) -> Value {
-    serde_json::to_value(design_summary(design)).unwrap_or(Value::Null)
-}
-
-pub fn tree_payload(genome: &Genome, frame: Option<&str>, options: &TreeOptions, include_assets: bool) -> Value {
+pub fn tree_payload(
+    genome: &Genome,
+    frame: Option<&str>,
+    options: &TreeOptions,
+    include_assets: bool,
+) -> Value {
     let tree = extract_tree(genome, frame, options);
     let mut payload = json!({ "items": tree });
     if include_assets {

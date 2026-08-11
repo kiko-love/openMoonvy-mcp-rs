@@ -1,10 +1,11 @@
-/**
+/*
  * Frontend workspace catalog: .moonvy-mcp/catalog.json + aliases.json
  * and name-based search (ported from the TypeScript version).
  */
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -53,7 +54,8 @@ impl Catalog {
     pub fn load(workspace_dir: &Path) -> anyhow::Result<Self> {
         let path = catalog_path(workspace_dir);
         match std::fs::read_to_string(&path) {
-            Ok(raw) => serde_json::from_str(&raw).with_context(|| format!("catalog is not valid JSON: {}", path.display())),
+            Ok(raw) => serde_json::from_str(&raw)
+                .with_context(|| format!("catalog is not valid JSON: {}", path.display())),
             Err(_) => Ok(Self::default()),
         }
     }
@@ -63,7 +65,8 @@ impl Catalog {
         std::fs::create_dir_all(path.parent().expect("catalog path has a parent"))
             .with_context(|| format!("failed to create {}", MOONVY_DIR))?;
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, format!("{json}\n")).with_context(|| format!("failed to write {}", path.display()))
+        std::fs::write(&path, format!("{json}\n"))
+            .with_context(|| format!("failed to write {}", path.display()))
     }
 }
 
@@ -71,83 +74,100 @@ fn catalog_path(workspace_dir: &Path) -> PathBuf {
     workspace_dir.join(MOONVY_DIR).join("catalog.json")
 }
 
-
+/// Absolute path of a workspace artifact file (catalog.json / aliases.json).
+pub fn artifact_path(workspace_dir: &Path, kind: &str) -> PathBuf {
+    workspace_dir.join(MOONVY_DIR).join(format!("{kind}.json"))
+}
 
 fn normalize_for_search(value: &str) -> String {
     value.trim().to_lowercase()
 }
 
-pub fn search_catalog(catalog: &Catalog, aliases: &HashMap<String, serde_json::Value>, query: &str) -> Vec<CatalogMatch> {
+/// Pre-normalized alias map: alias name -> target names (lowercased).
+fn normalized_alias_targets(aliases: &HashMap<String, Value>) -> Vec<(String, Vec<String>)> {
+    aliases
+        .iter()
+        .map(|(from, to)| {
+            let targets = match to {
+                Value::Array(items) => items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(normalize_for_search))
+                    .collect(),
+                Value::String(s) => vec![normalize_for_search(s)],
+                _ => Vec::new(),
+            };
+            (normalize_for_search(from), targets)
+        })
+        .collect()
+}
+
+pub fn search_catalog(
+    catalog: &Catalog,
+    aliases: &HashMap<String, serde_json::Value>,
+    query: &str,
+) -> Vec<CatalogMatch> {
     let q = normalize_for_search(query);
     if q.is_empty() {
         return Vec::new();
     }
-    // Collect alias targets that match the query
-    let alias_targets: Vec<String> = aliases
+    let alias_rows = normalized_alias_targets(aliases);
+    let alias_matches_query: Vec<&str> = alias_rows
         .iter()
-        .flat_map(|(from, to)| {
-            let targets: Vec<String> = match to {
-                serde_json::Value::Array(items) => items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
-                serde_json::Value::String(s) => vec![s.clone()],
-                _ => Vec::new(),
-            };
-            let from_matches = normalize_for_search(from).contains(&q);
-            let to_matches = targets.iter().any(|t| normalize_for_search(t).contains(&q));
-            if from_matches || to_matches { targets } else { Vec::new() }
-        })
+        .filter(|(from, targets)| from.contains(&q) || targets.iter().any(|t| t.contains(&q)))
+        .flat_map(|(_, targets)| targets.iter().map(String::as_str))
         .collect();
 
     let mut matches: Vec<CatalogMatch> = catalog
         .designs
         .iter()
         .filter_map(|design| {
-            let fields = [
-                design.id.clone(),
-                design.name.clone(),
-                design.url.clone(),
-            ]
-            .into_iter()
-            .chain(design.aliases.iter().cloned())
-            .chain(design.tags.iter().cloned())
-            .collect::<Vec<_>>();
-
-            let mut exact = false;
-            let mut includes = false;
-            for field in &fields {
-                let normalized = normalize_for_search(field);
-                if normalized == q {
-                    exact = true;
-                }
-                if normalized.contains(&q) {
-                    includes = true;
-                }
-                if exact && includes {
-                    break;
-                }
-            }
-            let alias_match = alias_targets.iter().any(|t| normalize_for_search(t) == normalize_for_search(&design.name))
-                || design.aliases.iter().any(|alias| alias_targets.iter().any(|t| normalize_for_search(t) == normalize_for_search(alias)))
-                || alias_targets.iter().any(|t| normalize_for_search(t) == normalize_for_search(&design.id));
-
-            if !exact && !includes && !alias_match {
+            let name = normalize_for_search(&design.name);
+            let id = normalize_for_search(&design.id);
+            let url = normalize_for_search(&design.url);
+            let alias_hits = design.aliases.iter().any(|a| {
+                let a = normalize_for_search(a);
+                a == q || alias_matches_query.iter().any(|t| *t == a)
+            });
+            let exact = name == q
+                || id == q
+                || url == q
+                || design.aliases.iter().any(|a| normalize_for_search(a) == q)
+                || design.tags.iter().any(|t| normalize_for_search(t) == q);
+            let includes = name.contains(&q)
+                || id.contains(&q)
+                || url.contains(&q)
+                || design
+                    .aliases
+                    .iter()
+                    .any(|a| normalize_for_search(a).contains(&q))
+                || design
+                    .tags
+                    .iter()
+                    .any(|t| normalize_for_search(t).contains(&q));
+            let alias_match = alias_matches_query.iter().any(|t| *t == name || *t == id);
+            if !(exact || includes || alias_match || alias_hits) {
                 return None;
             }
             let (score, reason) = if exact {
                 (100u32, "exact".to_string())
-            } else if alias_match {
+            } else if alias_match || alias_hits {
                 (80u32, "alias-map".to_string())
             } else {
                 (50u32, "contains".to_string())
             };
-            Some(CatalogMatch { design: design.clone(), score, match_reason: reason })
+            Some(CatalogMatch {
+                design: design.clone(),
+                score,
+                match_reason: reason,
+            })
         })
         .collect();
-    matches.sort_by(|a, b| b.score.cmp(&a.score).then(a.design.name.cmp(&b.design.name)));
+    matches.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then(a.design.name.cmp(&b.design.name))
+    });
     matches
-}
-
-pub fn design_summary(design: &CatalogDesign) -> CatalogDesign {
-    design.clone()
 }
 
 /// Basic workspace validation: absolute path, must exist as a directory.
@@ -157,7 +177,9 @@ pub fn resolve_workspace_dir(dir: &str) -> anyhow::Result<PathBuf> {
         anyhow::bail!("workspaceDir must be an absolute path to the real frontend project root.");
     }
     if !path.is_dir() {
-        anyhow::bail!("workspaceDir \"{dir}\" does not exist; create the frontend project root first.");
+        anyhow::bail!(
+            "workspaceDir \"{dir}\" does not exist; create the frontend project root first."
+        );
     }
     Ok(path)
 }
@@ -214,6 +236,19 @@ mod tests {
         let matches = search_catalog(&c, &aliases, "Home");
         assert_eq!(matches[0].score, 100, "exact match ranks first");
         assert_eq!(matches[0].match_reason, "exact");
+    }
+
+    #[test]
+    fn search_via_design_alias() {
+        let catalog = sample_catalog();
+        let mut aliases: HashMap<String, serde_json::Value> = HashMap::new();
+        aliases.insert("auth/pages.vue".into(), serde_json::json!("login-page"));
+        let mut c = catalog.clone();
+        c.designs[1].aliases = vec!["login-page".to_string()];
+        let matches = search_catalog(&c, &aliases, "auth/pages.vue");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].design.name, "Login");
+        assert_eq!(matches[0].match_reason, "alias-map");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-/**
+/*
  * openMoonvy-mcp-rs — Moonvy design extraction MCP server (Rust).
  *
  * PoC scope: moonvy_get_design / moonvy_get_tree / moonvy_extract_tokens
@@ -8,14 +8,15 @@
 mod api;
 mod catalog;
 mod genome;
+mod login;
 mod server;
 mod token;
 mod tools;
 
 use std::sync::Arc;
 
-use rmcp::transport::stdio;
 use rmcp::ServiceExt;
+use rmcp::transport::stdio;
 
 use api::MoonvyApi;
 use server::MoonvyServer;

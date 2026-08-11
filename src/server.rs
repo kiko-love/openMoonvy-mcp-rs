@@ -1,4 +1,4 @@
-/**
+/*
  * Moonvy MCP server: full tool set. Business logic lives in tools.rs;
  * this module only declares tool schemas and routes calls.
  */
@@ -9,14 +9,19 @@ use rmcp::{
     ErrorData as McpError, ServerHandler,
     handler::server::router::tool::ToolRouter,
     handler::server::wrapper::Parameters,
-    model::{Implementation, ServerCapabilities, ServerInfo},
+    model::{
+        CompleteResult, CompletionInfo, GetPromptResponse, GetPromptResult, Implementation,
+        ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, Prompt,
+        ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, ResourceTemplate,
+        ServerCapabilities, ServerInfo,
+    },
     schemars, tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::api::MoonvyApi;
-use crate::catalog::{Catalog, resolve_workspace_dir};
+use crate::catalog::{Catalog, artifact_path, resolve_workspace_dir};
 use crate::genome::TreeOptions;
 use crate::tools;
 
@@ -28,8 +33,34 @@ pub struct MoonvyServer {
 
 impl MoonvyServer {
     pub fn new(api: Arc<MoonvyApi>) -> Self {
-        Self { tool_router: Self::tool_router(), api }
+        Self {
+            tool_router: Self::tool_router(),
+            api,
+        }
     }
+}
+
+/// Workspaces advertised via resources/completion (MOONVY_WORKSPACE_DIR /
+/// MOONVY_ALLOWED_WORKSPACES), deduplicated.
+pub fn known_workspaces() -> Vec<String> {
+    let mut dirs: Vec<String> = Vec::new();
+    for raw in [
+        std::env::var("MOONVY_WORKSPACE_DIR"),
+        std::env::var("MOONVY_ALLOWED_WORKSPACES"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        dirs.extend(
+            raw.split([';', '|'])
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+                .map(str::to_string),
+        );
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
 }
 
 /* ------------------------------- tool inputs ------------------------------- */
@@ -119,6 +150,33 @@ fn default_limit_50() -> u32 {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct FindNodeRequest {
+    /// Moonvy design URL
+    pub url: String,
+    /// Case-insensitive substring to match against node names and text
+    pub query: String,
+    /// Optional frame/page ID filter
+    pub frame: Option<String>,
+    /// Maximum matches to return
+    #[serde(default = "default_limit_50")]
+    pub limit: u32,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetUrlRequest {
+    /// Moonvy design or project URL
+    pub url: String,
+    /// Moonvy node ID or file UUID
+    pub node: String,
+    /// Asset type: slice, snapshot, or image (autodetected)
+    pub r#type: Option<String>,
+    /// Slice format/ratio: svg, base, max
+    pub slice_format: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct NodeStyleRequest {
     /// Moonvy design URL
     pub url: String,
@@ -142,6 +200,9 @@ pub struct ContextRequest {
     pub flatten: bool,
     /// Keep only nodes of these types
     pub only: Option<Vec<String>>,
+    /// Annotate nodes whose content repeats an earlier node with duplicateOf
+    #[serde(default)]
+    pub detect_duplicates: bool,
     /// Include the deduplicated asset manifest
     #[serde(default)]
     pub include_assets: bool,
@@ -214,6 +275,17 @@ pub struct TreeByNameRequest {
     /// Maximum child depth
     #[serde(default = "default_max_depth")]
     pub max_depth: usize,
+    /// Drop empty container groups and lift their children up
+    #[serde(default)]
+    pub skip_empty_groups: bool,
+    /// Emit coordinates relative to the artboard origin
+    #[serde(default)]
+    pub flatten: bool,
+    /// Keep only nodes of these types (children filtered recursively)
+    pub only: Option<Vec<String>>,
+    /// Annotate nodes whose content repeats an earlier node with duplicateOf
+    #[serde(default)]
+    pub detect_duplicates: bool,
 }
 
 fn default_true() -> bool {
@@ -232,22 +304,64 @@ pub struct DiffDesignsRequest {
     /// Include style in the comparison
     #[serde(default = "default_true")]
     pub with_style: bool,
+    /// Drop empty container groups before comparing
+    #[serde(default)]
+    pub skip_empty_groups: bool,
+    /// Compare absolute coordinates (relative to the artboard origin)
+    #[serde(default)]
+    pub flatten: bool,
+    /// Keep only nodes of these types before comparing
+    pub only: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetTokenRequest {
+    /// Moonvy JWT token from a logged-in browser session
+    pub token: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginRequest {
+    /// Maximum time to wait for the user to complete login in the browser window (ms)
+    #[serde(default = "default_timeout_300000")]
+    pub timeout_ms: u64,
+}
+
+fn default_timeout_300000() -> u64 {
+    300_000
 }
 
 /* ---------------------------------- tools ---------------------------------- */
 
 #[tool_router(router = tool_router)]
 impl MoonvyServer {
-    #[tool(name = "moonvy_get_design", description = "Design metadata: title and frame dimensions. Returns { items: [ { title, frameCount, frames: [{id,name,width,height}] } ] }. Accepts a design file URL or a project directory URL (auto-resolved).")]
-    async fn get_design(&self, Parameters(req): Parameters<GetDesignRequest>) -> Result<String, McpError> {
-        let (_, genome) = tools::genome_for_url(&self.api, &req.url).await.map_err(tools::tool_error)?;
+    #[tool(
+        name = "moonvy_get_design",
+        description = "Design metadata: title and frame dimensions. Returns { items: [ { title, frameCount, frames: [{id,name,width,height}] } ] }. Accepts a design file URL or a project directory URL (auto-resolved)."
+    )]
+    async fn get_design(
+        &self,
+        Parameters(req): Parameters<GetDesignRequest>,
+    ) -> Result<String, McpError> {
+        let (_, genome) = tools::genome_for_url(&self.api, &req.url)
+            .await
+            .map_err(tools::tool_error)?;
         let meta = crate::genome::extract_design_meta(&genome, None);
         tools::json_string(json!({ "items": [meta] }))
     }
 
-    #[tool(name = "moonvy_get_tree", description = "Full layer tree. Returns { items: [ {id,name,type,x,y,width,height,text?,style?,children?,duplicateOf?} ], assets? }. Supports skipEmptyGroups, flatten, only, detectDuplicates, includeAssets.")]
-    async fn get_tree(&self, Parameters(req): Parameters<GetTreeRequest>) -> Result<String, McpError> {
-        let (_, genome) = tools::genome_for_url(&self.api, &req.url).await.map_err(tools::tool_error)?;
+    #[tool(
+        name = "moonvy_get_tree",
+        description = "Full layer tree. Returns { items: [ {id,name,type,x,y,width,height,text?,style?,children?,duplicateOf?} ], assets? }. Supports skipEmptyGroups, flatten, only, detectDuplicates, includeAssets."
+    )]
+    async fn get_tree(
+        &self,
+        Parameters(req): Parameters<GetTreeRequest>,
+    ) -> Result<String, McpError> {
+        let (_, genome) = tools::genome_for_url(&self.api, &req.url)
+            .await
+            .map_err(tools::tool_error)?;
         let options = TreeOptions {
             with_style: req.with_style,
             max_depth: req.max_depth,
@@ -256,39 +370,132 @@ impl MoonvyServer {
             only: req.only,
             detect_duplicates: req.detect_duplicates,
         };
-        tools::json_string(tools::tree_payload(&genome, req.frame.as_deref(), &options, req.include_assets))
+        tools::json_string(tools::tree_payload(
+            &genome,
+            req.frame.as_deref(),
+            &options,
+            req.include_assets,
+        ))
     }
 
-    #[tool(name = "moonvy_extract_tokens", description = "Design tokens: colors, fontSizes, radii, spacing. Returns { items: [ {colors:[...],fontSizes:[...],radii:[...],spacing:[...]} ] }.")]
-    async fn extract_tokens(&self, Parameters(req): Parameters<GetTokensRequest>) -> Result<String, McpError> {
-        let (_, genome) = tools::genome_for_url(&self.api, &req.url).await.map_err(tools::tool_error)?;
+    #[tool(
+        name = "moonvy_extract_tokens",
+        description = "Design tokens: colors, fontSizes, radii, spacing. Returns { items: [ {colors:[...],fontSizes:[...],radii:[...],spacing:[...]} ] }."
+    )]
+    async fn extract_tokens(
+        &self,
+        Parameters(req): Parameters<GetTokensRequest>,
+    ) -> Result<String, McpError> {
+        let (_, genome) = tools::genome_for_url(&self.api, &req.url)
+            .await
+            .map_err(tools::tool_error)?;
         let tokens = crate::genome::extract_tokens(&genome);
         tools::json_string(json!({ "items": [tokens] }))
     }
 
-    #[tool(name = "moonvy_list_pages", description = "List pages/files in a Moonvy project. Returns { items: [{id,name,type,url,preview?}] }. Start here to discover design file URLs from a project directory URL.")]
-    async fn list_pages(&self, Parameters(req): Parameters<ListPagesRequest>) -> Result<String, McpError> {
-        let rows = tools::list_pages(&self.api, &req.url, req.limit, req.max_pages).await.map_err(tools::tool_error)?;
+    #[tool(
+        name = "moonvy_list_pages",
+        description = "List pages/files in a Moonvy project. Returns { items: [{id,name,type,url,preview?}] }. Start here to discover design file URLs from a project directory URL."
+    )]
+    async fn list_pages(
+        &self,
+        Parameters(req): Parameters<ListPagesRequest>,
+    ) -> Result<String, McpError> {
+        let rows = tools::list_pages(&self.api, &req.url, req.limit, req.max_pages)
+            .await
+            .map_err(tools::tool_error)?;
         tools::json_string(json!({ "items": rows }))
     }
 
-    #[tool(name = "moonvy_list_layers", description = "Flattened layer list: id, name, type, x, y, width, height. Returns { items: [...] }. Use this to discover valid node IDs.")]
-    async fn list_layers(&self, Parameters(req): Parameters<ListLayersRequest>) -> Result<String, McpError> {
-        let (_, genome) = tools::genome_for_url(&self.api, &req.url).await.map_err(tools::tool_error)?;
-        let layers = crate::genome::extract_layers(&genome, req.frame.as_deref(), req.limit as usize);
+    #[tool(
+        name = "moonvy_list_layers",
+        description = "Flattened layer list: id, name, type, x, y, width, height. Returns { items: [...] }. Use this to discover valid node IDs."
+    )]
+    async fn list_layers(
+        &self,
+        Parameters(req): Parameters<ListLayersRequest>,
+    ) -> Result<String, McpError> {
+        let (_, genome) = tools::genome_for_url(&self.api, &req.url)
+            .await
+            .map_err(tools::tool_error)?;
+        let layers =
+            crate::genome::extract_layers(&genome, req.frame.as_deref(), req.limit as usize);
         tools::json_string(json!({ "items": layers }))
     }
 
-    #[tool(name = "moonvy_get_node_style", description = "Normalized style of one node: background, color, fontSize, fontWeight, borderRadius, opacity, strokeWidth, strokeColor, gradient. Returns { items: [...] } (null when not set).")]
-    async fn get_node_style(&self, Parameters(req): Parameters<NodeStyleRequest>) -> Result<String, McpError> {
-        let (_, genome) = tools::genome_for_url(&self.api, &req.url).await.map_err(tools::tool_error)?;
+    #[tool(
+        name = "moonvy_get_node_style",
+        description = "Normalized style of one node: background, color, fontSize, fontWeight, borderRadius, opacity, strokeWidth, strokeColor, gradient. Returns { items: [...] } (null when not set)."
+    )]
+    async fn get_node_style(
+        &self,
+        Parameters(req): Parameters<NodeStyleRequest>,
+    ) -> Result<String, McpError> {
+        let (_, genome) = tools::genome_for_url(&self.api, &req.url)
+            .await
+            .map_err(tools::tool_error)?;
         let rows = crate::genome::extract_node_style(&genome, &req.node);
         tools::json_string(json!({ "items": rows }))
     }
 
-    #[tool(name = "moonvy_get_design_context", description = "One-call bundle: { design: metadata, tree: { items, assets? }, tokens: { items } }. THE recommended entry point for design work.")]
-    async fn get_design_context(&self, Parameters(req): Parameters<ContextRequest>) -> Result<String, McpError> {
-        let (_, genome) = tools::genome_for_url(&self.api, &req.url).await.map_err(tools::tool_error)?;
+    #[tool(
+        name = "moonvy_find_node",
+        description = "Search a design by node name or text content (case-insensitive substring). Returns { items: [ {id,name,type,x,y,width,height,text?} ] } - the targeted alternative to dumping the whole tree."
+    )]
+    async fn find_node(
+        &self,
+        Parameters(req): Parameters<FindNodeRequest>,
+    ) -> Result<String, McpError> {
+        let (_, genome) = tools::genome_for_url(&self.api, &req.url)
+            .await
+            .map_err(tools::tool_error)?;
+        let hits = crate::genome::find_nodes(
+            &genome,
+            req.frame.as_deref(),
+            &req.query,
+            req.limit as usize,
+        );
+        tools::json_string(json!({ "items": hits }))
+    }
+
+    #[tool(
+        name = "moonvy_get_asset_url",
+        description = "Resolve the direct download URL of a slice/snapshot/image without downloading. Returns { items: [ {node,name,url,type} ] } - pair with the URL in the tree's assets manifest or fetch it yourself."
+    )]
+    async fn get_asset_url(
+        &self,
+        Parameters(req): Parameters<AssetUrlRequest>,
+    ) -> Result<String, McpError> {
+        let resolved = tools::resolve_asset(
+            &self.api,
+            &req.url,
+            &req.node,
+            req.r#type.as_deref(),
+            req.slice_format.as_deref(),
+        )
+        .await
+        .map_err(tools::tool_error)?;
+        tools::json_string(json!({
+            "items": [{
+                "node": req.node,
+                "name": resolved.name,
+                "url": resolved.url,
+                "type": req.r#type.unwrap_or_else(|| "auto".to_string()),
+            }]
+        }))
+    }
+
+    #[tool(
+        name = "moonvy_get_design_context",
+        description = "One-call bundle: { design: metadata, tree: { items, assets? }, tokens: { items } }. THE recommended entry point for design work. Tree supports skipEmptyGroups, flatten, only, detectDuplicates, includeAssets."
+    )]
+    async fn get_design_context(
+        &self,
+        Parameters(req): Parameters<ContextRequest>,
+    ) -> Result<String, McpError> {
+        let (_, genome) = tools::genome_for_url(&self.api, &req.url)
+            .await
+            .map_err(tools::tool_error)?;
         let meta = crate::genome::extract_design_meta(&genome, None);
         let options = TreeOptions {
             with_style: true,
@@ -296,15 +503,21 @@ impl MoonvyServer {
             skip_empty_groups: req.skip_empty_groups,
             flatten: req.flatten,
             only: req.only,
-            detect_duplicates: false,
+            detect_duplicates: req.detect_duplicates,
         };
         let tree = tools::tree_payload(&genome, None, &options, req.include_assets);
         let tokens = crate::genome::extract_tokens(&genome);
         tools::json_string(json!({ "design": meta, "tree": tree, "tokens": { "items": [tokens] } }))
     }
 
-    #[tool(name = "moonvy_download_asset", description = "Download a slice, snapshot or image fill from a Moonvy node. Returns { items: [ {success,path,size,name,url} ] }. out must be an absolute directory or file path.")]
-    async fn download_asset(&self, Parameters(req): Parameters<DownloadAssetRequest>) -> Result<String, McpError> {
+    #[tool(
+        name = "moonvy_download_asset",
+        description = "Download a slice, snapshot or image fill from a Moonvy node. Returns { items: [ {success,path,size,name,url} ] }. out must be an absolute directory or file path."
+    )]
+    async fn download_asset(
+        &self,
+        Parameters(req): Parameters<DownloadAssetRequest>,
+    ) -> Result<String, McpError> {
         let (save_path, size, file_name, url) = tools::download_asset(
             &self.api,
             &req.url,
@@ -316,15 +529,25 @@ impl MoonvyServer {
         )
         .await
         .map_err(tools::tool_error)?;
-        tools::json_string(json!({ "items": [{ "success": true, "path": save_path.to_string_lossy(), "size": size, "name": file_name, "url": url }] }))
+        tools::json_string(
+            json!({ "items": [{ "success": true, "path": save_path.to_string_lossy(), "size": size, "name": file_name, "url": url }] }),
+        )
     }
 
-    #[tool(name = "moonvy_sync_project", description = "Scan a Moonvy project and write .moonvy-mcp/catalog.json (design index) into the frontend workspace. Run once per project; afterwards moonvy_search_designs and moonvy_get_tree_by_name resolve designs by name.")]
-    async fn sync_project(&self, Parameters(req): Parameters<SyncProjectRequest>) -> Result<String, McpError> {
+    #[tool(
+        name = "moonvy_sync_project",
+        description = "Scan a Moonvy project and write .moonvy-mcp/catalog.json (design index) into the frontend workspace. Run once per project; afterwards moonvy_search_designs and moonvy_get_tree_by_name resolve designs by name."
+    )]
+    async fn sync_project(
+        &self,
+        Parameters(req): Parameters<SyncProjectRequest>,
+    ) -> Result<String, McpError> {
         let workspace = resolve_workspace_dir(&req.workspace_dir).map_err(tools::tool_error)?;
         let clean_url = tools::sanitize_url(&req.project_url);
         let mut previous = Catalog::load(&workspace).map_err(tools::tool_error)?;
-        let rows = tools::list_pages(&self.api, &req.project_url, req.limit, req.max_pages).await.map_err(tools::tool_error)?;
+        let rows = tools::list_pages(&self.api, &req.project_url, req.limit, req.max_pages)
+            .await
+            .map_err(tools::tool_error)?;
         let include_types: Vec<String> = req
             .types
             .clone()
@@ -337,7 +560,10 @@ impl MoonvyServer {
 
         previous.sources.retain(|s| s.url != clean_url);
         previous.sources.push(crate::catalog::CatalogSource {
-            name: req.name.clone().unwrap_or_else(|| "Moonvy Project".to_string()),
+            name: req
+                .name
+                .clone()
+                .unwrap_or_else(|| "Moonvy Project".to_string()),
             url: clean_url,
             last_synced_at: now.clone(),
         });
@@ -346,59 +572,88 @@ impl MoonvyServer {
         previous.designs = designs;
         previous.save(&workspace).map_err(tools::tool_error)?;
 
-        let aliases_file = workspace.join(crate::catalog::MOONVY_DIR).join("aliases.json");
+        let aliases_file = artifact_path(&workspace, "aliases");
         if !aliases_file.exists() {
-            std::fs::create_dir_all(aliases_file.parent().expect("aliases path has a parent")).map_err(tools::tool_error)?;
+            std::fs::create_dir_all(aliases_file.parent().expect("aliases path has a parent"))
+                .map_err(tools::tool_error)?;
             std::fs::write(&aliases_file, "{}\n").map_err(tools::tool_error)?;
         }
 
         tools::json_string(json!({
             "workspaceDir": workspace.to_string_lossy(),
-            "catalogPath": workspace.join(crate::catalog::MOONVY_DIR).join("catalog.json").to_string_lossy(),
+            "catalogPath": artifact_path(&workspace, "catalog").to_string_lossy(),
             "aliasesPath": aliases_file.to_string_lossy(),
             "aliasesCreated": true,
             "includeTypes": include_types,
             "scannedCount": rows.len(),
             "designCount": previous.designs.len(),
             "sourceCount": previous.sources.len(),
-            "designs": previous.designs.iter().map(tools::design_summary_json).collect::<Vec<_>>(),
+            "designs": previous.designs.iter().map(|d| serde_json::to_value(d).unwrap_or(Value::Null)).collect::<Vec<_>>(),
         }))
     }
 
-    #[tool(name = "moonvy_search_designs", description = "Search the synced catalog (.moonvy-mcp/catalog.json) by design name, ID, URL, alias, tag or file path. Returns { matches: [{name,url,score,matchReason}] }. Requires moonvy_sync_project first.")]
-    async fn search_designs(&self, Parameters(req): Parameters<SearchDesignsRequest>) -> Result<String, McpError> {
+    #[tool(
+        name = "moonvy_search_designs",
+        description = "Search the synced catalog (.moonvy-mcp/catalog.json) by design name, ID, URL, alias, tag or file path. Returns { matches: [{name,url,score,matchReason}] }. Requires moonvy_sync_project first."
+    )]
+    async fn search_designs(
+        &self,
+        Parameters(req): Parameters<SearchDesignsRequest>,
+    ) -> Result<String, McpError> {
         let workspace = resolve_workspace_dir(&req.workspace_dir).map_err(tools::tool_error)?;
-        let matches = tools::search_designs(&workspace, &req.query, req.limit).map_err(tools::tool_error)?;
+        let matches =
+            tools::search_designs(&workspace, &req.query, req.limit).map_err(tools::tool_error)?;
         tools::json_string(json!({
             "workspaceDir": workspace.to_string_lossy(),
-            "catalogPath": workspace.join(crate::catalog::MOONVY_DIR).join("catalog.json").to_string_lossy(),
-            "aliasesPath": workspace.join(crate::catalog::MOONVY_DIR).join("aliases.json").to_string_lossy(),
+            "catalogPath": artifact_path(&workspace, "catalog").to_string_lossy(),
+            "aliasesPath": artifact_path(&workspace, "aliases").to_string_lossy(),
             "query": req.query,
             "matches": matches,
         }))
     }
 
-    #[tool(name = "moonvy_get_tree_by_name", description = "Resolve one design from the synced catalog by name/alias/tag/URL/ID, then return its layer tree. Returns { status: ok|not_found|ambiguous, tree: { items } } when ok.")]
-    async fn get_tree_by_name(&self, Parameters(req): Parameters<TreeByNameRequest>) -> Result<String, McpError> {
+    #[tool(
+        name = "moonvy_get_tree_by_name",
+        description = "Resolve one design from the synced catalog by name/alias/tag/URL/ID, then return its layer tree. Returns { status: ok|not_found|ambiguous, tree: { items } } when ok."
+    )]
+    async fn get_tree_by_name(
+        &self,
+        Parameters(req): Parameters<TreeByNameRequest>,
+    ) -> Result<String, McpError> {
         let workspace = resolve_workspace_dir(&req.workspace_dir).map_err(tools::tool_error)?;
-        let matches = tools::search_designs(&workspace, &req.name, 20).map_err(tools::tool_error)?;
+        let matches =
+            tools::search_designs(&workspace, &req.name, 20).map_err(tools::tool_error)?;
         if matches.len() != 1 {
-            let status = if matches.is_empty() { "not_found" } else { "ambiguous" };
+            let status = if matches.is_empty() {
+                "not_found"
+            } else {
+                "ambiguous"
+            };
             return tools::json_string(json!({
                 "status": status,
                 "workspaceDir": workspace.to_string_lossy(),
-                "catalogPath": workspace.join(crate::catalog::MOONVY_DIR).join("catalog.json").to_string_lossy(),
+                "catalogPath": artifact_path(&workspace, "catalog").to_string_lossy(),
                 "query": req.name,
                 "matches": matches,
             }));
         }
-        let design_url = matches[0].get("url").and_then(|u| u.as_str()).unwrap_or_default().to_string();
-        let design: crate::catalog::CatalogDesign = serde_json::from_value(matches[0].clone()).map_err(tools::tool_error)?;
-        let (_, genome) = tools::genome_for_url(&self.api, &design_url).await.map_err(tools::tool_error)?;
+        let design_url = matches[0]
+            .get("url")
+            .and_then(|u| u.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let design: crate::catalog::CatalogDesign =
+            serde_json::from_value(matches[0].clone()).map_err(tools::tool_error)?;
+        let (_, genome) = tools::genome_for_url(&self.api, &design_url)
+            .await
+            .map_err(tools::tool_error)?;
         let options = TreeOptions {
             with_style: req.with_style,
             max_depth: req.max_depth,
-            ..Default::default()
+            skip_empty_groups: req.skip_empty_groups,
+            flatten: req.flatten,
+            only: req.only,
+            detect_duplicates: req.detect_duplicates,
         };
         let tree = crate::genome::extract_tree(&genome, req.frame.as_deref(), &options);
         tools::json_string(json!({
@@ -409,19 +664,91 @@ impl MoonvyServer {
         }))
     }
 
-    #[tool(name = "moonvy_diff_designs", description = "Compare two design URLs by node id and return added/removed/changed layers — use this to see what differs between states (e.g. normal vs hover).")]
-    async fn diff_designs(&self, Parameters(req): Parameters<DiffDesignsRequest>) -> Result<String, McpError> {
-        let (_, genome_a) = tools::genome_for_url(&self.api, &req.url_a).await.map_err(tools::tool_error)?;
-        let (_, genome_b) = tools::genome_for_url(&self.api, &req.url_b).await.map_err(tools::tool_error)?;
-        let options = TreeOptions { with_style: req.with_style, ..Default::default() };
+    #[tool(
+        name = "moonvy_set_token",
+        description = "Save a Moonvy JWT for API access (valid ~180 days). Returns expiry info. Prefer moonvy_login for a guided browser login."
+    )]
+    async fn set_token(
+        &self,
+        Parameters(req): Parameters<SetTokenRequest>,
+    ) -> Result<String, McpError> {
+        let info = crate::token::save_token(&req.token).map_err(tools::tool_error)?;
+        tools::json_string(serde_json::to_value(info).map_err(tools::tool_error)?)
+    }
+
+    #[tool(
+        name = "moonvy_login",
+        description = "Guided login: opens Chrome/Edge at moonvy.com, waits for the user to log in, captures and saves the auth token. THE recovery step when tools report [AUTH_REQUIRED] or [AUTH_EXPIRED] - call it and then retry the failed tool. Falls back to manual: set MOONVY_TOKEN or copy window.app.api.$options.token into moonvy_set_token."
+    )]
+    async fn login(&self, Parameters(req): Parameters<LoginRequest>) -> Result<String, McpError> {
+        let outcome = crate::login::login(req.timeout_ms)
+            .await
+            .map_err(tools::tool_error)?;
+        tools::json_string(json!({
+            "loggedIn": true,
+            "method": outcome.method,
+            "savedAt": outcome.token_info.saved_at,
+            "expiresAt": outcome.token_info.expires_at,
+            "daysUntilExpiry": outcome.token_info.days_until_expiry,
+            "userId": outcome.token_info.user_id,
+            "email": outcome.token_info.email,
+        }))
+    }
+
+    #[tool(
+        name = "moonvy_diff_designs",
+        description = "Compare two design URLs by node id (with same-name fallback) and return added/removed/changed layers with before/after snapshots - use this to see what differs between states (e.g. normal vs hover). Supports skipEmptyGroups, flatten, only."
+    )]
+    async fn diff_designs(
+        &self,
+        Parameters(req): Parameters<DiffDesignsRequest>,
+    ) -> Result<String, McpError> {
+        let (a, b) = tokio::join!(
+            tools::genome_for_url(&self.api, &req.url_a),
+            tools::genome_for_url(&self.api, &req.url_b),
+        );
+        let (_, genome_a) = a.map_err(tools::tool_error)?;
+        let (_, genome_b) = b.map_err(tools::tool_error)?;
+        let options = TreeOptions {
+            with_style: req.with_style,
+            skip_empty_groups: req.skip_empty_groups,
+            flatten: req.flatten,
+            only: req.only,
+            ..Default::default()
+        };
         let tree_a = crate::genome::extract_tree(&genome_a, req.frame.as_deref(), &options);
         let tree_b = crate::genome::extract_tree(&genome_b, req.frame.as_deref(), &options);
         let diff = crate::genome::diff_trees(&tree_a, &tree_b);
-        tools::json_string(json!({ "added": diff.added, "removed": diff.removed, "changed": diff.changed }))
+        tools::json_string(
+            json!({ "added": diff.added, "removed": diff.removed, "changed": diff.changed }),
+        )
     }
 }
 
 /* ------------------------------- server impl ------------------------------- */
+
+fn prompt_attr(name: &str, description: &str) -> Prompt {
+    Prompt::new(name.to_string(), Some(description.to_string()), None)
+}
+
+fn prompt_text(description: &str, text: String) -> GetPromptResponse {
+    GetPromptResult::new(vec![rmcp::model::PromptMessage::new_text(
+        rmcp::model::Role::User,
+        text,
+    )])
+    .with_description(description)
+    .into()
+}
+
+/// Read a string argument from a prompt request.
+fn arg(request: &rmcp::model::GetPromptRequestParams, key: &str) -> Option<String> {
+    request
+        .arguments
+        .as_ref()
+        .and_then(|a| a.get(key))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for MoonvyServer {
@@ -429,15 +756,298 @@ impl ServerHandler for MoonvyServer {
         let mut implementation = Implementation::from_build_env();
         implementation.name = "openmoonvy-mcp-rs".to_string();
         implementation.version = env!("CARGO_PKG_VERSION").to_string();
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(implementation)
-            .with_instructions(
-                "Moonvy design extraction server (Rust). Requires a Moonvy auth token: \
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_prompts()
+                .enable_resources()
+                .build(),
+        )
+        .with_server_info(implementation)
+        .with_instructions(
+            "Moonvy design extraction server (Rust). Requires a Moonvy auth token: \
                  set MOONVY_TOKEN or save ~/.moonvy-ai/token.json. \
                  Tools: moonvy_get_design, moonvy_get_design_context, moonvy_get_tree, \
-                 moonvy_list_pages, moonvy_list_layers, moonvy_get_node_style, \
-                 moonvy_extract_tokens, moonvy_download_asset, moonvy_sync_project, \
-                 moonvy_search_designs, moonvy_get_tree_by_name, moonvy_diff_designs.",
-            )
+                 moonvy_list_pages, moonvy_list_layers, moonvy_find_node, moonvy_get_node_style, \
+                 moonvy_extract_tokens, moonvy_get_asset_url, moonvy_download_asset, \
+                 moonvy_sync_project, moonvy_search_designs, moonvy_get_tree_by_name, \
+                 moonvy_diff_designs, moonvy_set_token.",
+        )
     }
+
+    fn list_prompts(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListPromptsResult, McpError>>
+    + rmcp::service::MaybeSendFuture
+    + '_ {
+        let prompts = vec![
+            prompt_attr(
+                "moonvy_restore_design",
+                "End-to-end workflow to turn a Moonvy design into frontend code: resolve the design, extract context, download assets, and generate implementation guidance.",
+            ),
+            prompt_attr(
+                "moonvy_handoff",
+                "Build a design handoff brief from a workspace catalog: design list, aliases and working-set guidance.",
+            ),
+            prompt_attr(
+                "moonvy_diff_states",
+                "Compare two design states (e.g. normal vs hover) and turn the difference into implementation guidance.",
+            ),
+        ];
+        std::future::ready(Ok(ListPromptsResult::with_all_items(prompts)))
+    }
+
+    fn get_prompt(
+        &self,
+        request: rmcp::model::GetPromptRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> impl std::future::Future<Output = Result<GetPromptResponse, McpError>>
+    + rmcp::service::MaybeSendFuture
+    + '_ {
+        std::future::ready(get_prompt_impl(&request))
+    }
+
+    fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListResourcesResult, McpError>>
+    + rmcp::service::MaybeSendFuture
+    + '_ {
+        let resources: Vec<Resource> = known_workspaces()
+            .into_iter()
+            .flat_map(|dir| {
+                ["catalog", "aliases"].into_iter().map(move |kind| {
+                    Resource::new(
+                        format!("moonvy://{kind}/{dir}"),
+                        format!("moonvy-{kind}-{}", dir.replace(['\\', '/', ':'], "_")),
+                    )
+                    .with_description(format!("Moonvy {kind} for workspace {dir}"))
+                    .with_mime_type("application/json")
+                })
+            })
+            .collect();
+        std::future::ready(Ok(ListResourcesResult::with_all_items(resources)))
+    }
+
+    fn list_resource_templates(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListResourceTemplatesResult, McpError>>
+    + rmcp::service::MaybeSendFuture
+    + '_ {
+        let templates = vec![
+            ResourceTemplate::new("moonvy://catalog/{workspaceId}", "moonvy-catalog")
+                .with_description("Sanitized Moonvy project catalog (.moonvy-mcp/catalog.json) for a frontend workspace.")
+                .with_mime_type("application/json"),
+            ResourceTemplate::new("moonvy://aliases/{workspaceId}", "moonvy-aliases")
+                .with_description("Frontend path <-> Moonvy design alias mappings (.moonvy-mcp/aliases.json).")
+                .with_mime_type("application/json"),
+        ];
+        std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(templates)))
+    }
+
+    fn read_resource(
+        &self,
+        request: rmcp::model::ReadResourceRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ReadResourceResponse, McpError>>
+    + rmcp::service::MaybeSendFuture
+    + '_ {
+        std::future::ready(read_resource_impl(&request.uri))
+    }
+
+    fn complete(
+        &self,
+        request: rmcp::model::CompleteRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> impl std::future::Future<Output = Result<CompleteResult, McpError>>
+    + rmcp::service::MaybeSendFuture
+    + '_ {
+        std::future::ready(complete_impl(&request))
+    }
+}
+
+fn get_prompt_impl(
+    request: &rmcp::model::GetPromptRequestParams,
+) -> Result<GetPromptResponse, McpError> {
+    match request.name.as_str() {
+        "moonvy_restore_design" => {
+            let url = arg(request, "url")
+                .filter(|u| !u.is_empty())
+                .ok_or_else(|| {
+                    McpError::invalid_params("url is required for moonvy_restore_design", None)
+                })?;
+            let stack = arg(request, "stack")
+                .unwrap_or_else(|| "not specified (use sensible defaults)".to_string());
+            let workspace_dir = arg(request, "workspaceDir");
+            let lines = [
+                format!("Design restore workflow for: {url}"),
+                format!("Target stack: {stack}"),
+                String::new(),
+                "Steps:".to_string(),
+                "1. Call moonvy_get_design_context on the URL (one call: metadata + layer tree with styles + tokens).".to_string(),
+                "2. Use the frame dimensions as the layout viewport; map tree nodes to UI components.".to_string(),
+                "3. Apply tokens (colors/fontSizes/radii/spacing) as design-system values.".to_string(),
+                "4. Call moonvy_download_asset for slice/snapshot assets (out must be an absolute path).".to_string(),
+                match workspace_dir {
+                    Some(ws) => format!("5. Optionally moonvy_sync_project to index the project (workspace: {ws})."),
+                    None => "5. Optionally moonvy_sync_project to index the project for name-based lookups.".to_string(),
+                },
+                String::new(),
+                "Guidance:".to_string(),
+                "- Check child nodes for real colors and radii (parent nodes often carry none).".to_string(),
+                "- Reuse tokens instead of hardcoding hex values.".to_string(),
+                "- Export icons and slices as SVG via moonvy_download_asset with sliceFormat: \"svg\".".to_string(),
+            ];
+            Ok(prompt_text(
+                &format!("Design restore workflow for {url}"),
+                lines.join("\n"),
+            ))
+        }
+        "moonvy_handoff" => {
+            let workspace_dir = arg(request, "workspaceDir").unwrap_or_default();            let workspace = resolve_workspace_dir(&workspace_dir).map_err(tools::tool_error)?;
+            let catalog = Catalog::load(&workspace).map_err(tools::tool_error)?;
+            let aliases: std::collections::HashMap<String, Value> =
+                std::fs::read_to_string(artifact_path(&workspace, "aliases"))
+                    .ok()
+                    .and_then(|raw| serde_json::from_str(&raw).ok())
+                    .unwrap_or_default();
+            let query = arg(request, "query");
+
+            let designs: Vec<String> = match query {
+                Some(query) => crate::tools::search_designs(&workspace, &query, 20)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|m| {
+                        m.get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?")
+                            .to_string()
+                    })
+                    .collect(),
+                None => catalog
+                    .designs
+                    .iter()
+                    .take(20)
+                    .map(|d| format!("{} ({}) {}", d.name, d.r#type, d.url))
+                    .collect(),
+            };
+            let mut lines = vec![
+                format!("Workspace: {}", workspace.display()),
+                format!(
+                    "Catalog: {}",
+                    artifact_path(&workspace, "catalog").display()
+                ),
+                format!("Designs ({}):", designs.len()),
+            ];
+            lines.extend(designs.into_iter().map(|d| format!("- {d}")));
+            if !aliases.is_empty() {
+                lines.push("Aliases:".to_string());
+                for (from, to) in aliases {
+                    lines.push(format!("- {from} -> {to}"));
+                }
+            }
+            lines.push(
+                "Use moonvy_get_tree_by_name to fetch a design tree, moonvy_extract_tokens for tokens, and moonvy_download_asset for assets.".to_string(),
+            );
+            Ok(prompt_text(
+                &format!(
+                    "Handoff for {} designs in {}",
+                    catalog.designs.len().min(20),
+                    workspace.display()
+                ),
+                lines.join("\n"),
+            ))
+        }
+        "moonvy_diff_states" => {
+            let url_a = arg(request, "urlA")
+                .filter(|u| !u.is_empty())
+                .ok_or_else(|| {
+                    McpError::invalid_params("urlA is required for moonvy_diff_states", None)
+                })?;
+            let url_b = arg(request, "urlB")
+                .filter(|u| !u.is_empty())
+                .ok_or_else(|| {
+                    McpError::invalid_params("urlB is required for moonvy_diff_states", None)
+                })?;
+            let stack = arg(request, "stack")
+                .unwrap_or_else(|| "not specified (use sensible defaults)".to_string());
+            let lines = [
+                format!("State diff workflow: {url_a} vs {url_b}"),
+                format!("Target stack: {stack}"),
+                String::new(),
+                "Steps:".to_string(),
+                "1. Call moonvy_get_tree on both URLs with withStyle: true, flatten: true, skipEmptyGroups: true (absolute coordinates, no container noise).".to_string(),
+                "2. Call moonvy_diff_designs with the same options to get added/removed/changed layers with before/after snapshots.".to_string(),
+                "3. Treat `changed` as the state transition: read `fields` (text/style/rect/childrenCount) and apply only those deltas on top of the base state.".to_string(),
+                "4. `added` layers belong to the new state only; `removed` layers must be hidden or removed.".to_string(),
+                "5. For any image/snapshot node, use moonvy_get_asset_url to fetch the direct URL, or moonvy_download_asset to save it.".to_string(),
+                String::new(),
+                "Guidance:".to_string(),
+                "- If both designs are separate pages, diff pairs nodes by id first, then by identical names; review unmatched added/removed as real structural changes.".to_string(),
+                "- Skip empty groups on both sides so coordinate deltas stay meaningful.".to_string(),
+            ];
+            Ok(prompt_text(
+                &format!("State diff workflow: {url_a} vs {url_b}"),
+                lines.join("\n"),
+            ))
+        }
+        other => Err(McpError::invalid_params(
+            format!("Prompt {other} not found"),
+            None,
+        )),
+    }
+}
+
+fn read_resource_impl(uri: &str) -> Result<ReadResourceResponse, McpError> {
+    let (kind, encoded) = if let Some(rest) = uri.strip_prefix("moonvy://catalog/") {
+        ("catalog", rest)
+    } else if let Some(rest) = uri.strip_prefix("moonvy://aliases/") {
+        ("aliases", rest)
+    } else {
+        return Err(McpError::invalid_params(
+            format!("Invalid resource URI: {uri}"),
+            None,
+        ));
+    };
+    let workspace = resolve_workspace_dir(encoded).map_err(tools::tool_error)?;
+    let text = std::fs::read_to_string(artifact_path(&workspace, kind)).map_err(|_| {
+        McpError::internal_error(
+            format!("No {kind}.json yet for workspace {encoded}; run moonvy_sync_project first."),
+            None,
+        )
+    })?;
+    Ok(
+        ReadResourceResult::new(vec![ResourceContents::TextResourceContents {
+            uri: uri.to_string(),
+            mime_type: Some("application/json".to_string()),
+            text,
+            meta: None,
+        }])
+        .into(),
+    )
+}
+
+fn complete_impl(request: &rmcp::model::CompleteRequestParams) -> Result<CompleteResult, McpError> {
+    let is_workspace_template = match &request.r#ref {
+        rmcp::model::Reference::Resource(r) => r.uri.contains("{workspaceId}"),
+        _ => false,
+    };
+    if !is_workspace_template || request.argument.name != "workspaceId" {
+        return Ok(CompleteResult::new(
+            CompletionInfo::new(vec![]).map_err(tools::tool_error)?,
+        ));
+    }
+    let query = request.argument.value.to_lowercase();
+    let values: Vec<String> = known_workspaces()
+        .into_iter()
+        .filter(|d| d.to_lowercase().contains(&query))
+        .collect();
+    Ok(CompleteResult::new(
+        CompletionInfo::new(values).map_err(tools::tool_error)?,
+    ))
 }

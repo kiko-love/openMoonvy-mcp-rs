@@ -1,9 +1,9 @@
-/**
+/*
  * Moonvy API client: authenticated fetch against global-api.moonvy.com.
  */
 
 use crate::genome::Genome;
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde_json::Value;
 
@@ -18,7 +18,6 @@ pub struct MoonvyApi {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
-#[allow(dead_code)]
 pub struct MoonvyNode {
     pub id: String,
     pub name: Option<String>,
@@ -31,7 +30,6 @@ pub struct MoonvyNode {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
-#[allow(dead_code)]
 pub struct Preview {
     pub normal: Option<String>,
     pub large: Option<String>,
@@ -39,7 +37,6 @@ pub struct Preview {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
-#[allow(dead_code)]
 pub struct Files {
     pub genome: Option<GenomeFile>,
     pub file: Option<FileRef>,
@@ -47,21 +44,18 @@ pub struct Files {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
-#[allow(dead_code)]
 pub struct GenomeFile {
     pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
-#[allow(dead_code)]
 pub struct FileRef {
     pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
-#[allow(dead_code)]
 pub struct NodeMeta {
     pub assets: Option<serde_json::Map<String, Value>>,
 }
@@ -74,14 +68,32 @@ impl MoonvyApi {
             .user_agent("moonvy-rs/0.1.0")
             .build()
             .context("failed to build http client")?;
-        Ok(Self { token, http, base: API_BASE.to_string() })
+        Ok(Self {
+            token,
+            http,
+            base: API_BASE.to_string(),
+        })
     }
 
-    pub async fn get_node(&self, project_id: &str, id: &str, lv: &str) -> anyhow::Result<MoonvyNode> {
-        self.post("/anynode/get", &serde_json::json!({ "projectId": project_id, "id": id, "lv": lv })).await
+    pub async fn get_node(
+        &self,
+        project_id: &str,
+        id: &str,
+        lv: &str,
+    ) -> anyhow::Result<MoonvyNode> {
+        self.post(
+            "/anynode/get",
+            &serde_json::json!({ "projectId": project_id, "id": id, "lv": lv }),
+        )
+        .await
     }
 
-    pub async fn list_nodes(&self, project_id: &str, page_index: u32, scope_id: Option<&str>) -> anyhow::Result<Value> {
+    pub async fn list_nodes(
+        &self,
+        project_id: &str,
+        page_index: u32,
+        scope_id: Option<&str>,
+    ) -> anyhow::Result<Value> {
         let mut body = serde_json::json!({ "projectId": project_id, "pageIndex": page_index });
         if let Some(id) = scope_id {
             body["id"] = serde_json::Value::String(id.to_string());
@@ -90,6 +102,13 @@ impl MoonvyApi {
     }
 
     pub async fn fetch_genome(&self, url: &str) -> anyhow::Result<Genome> {
+        let value = self.raw_json(url).await?;
+        serde_json::from_value(value).context("genome is not valid JSON")
+    }
+
+    /// Fetch a genome URL and parse it as raw JSON (untyped), skipping the
+    /// gzip autodetection only when the body is already JSON text.
+    pub async fn raw_json(&self, url: &str) -> anyhow::Result<Value> {
         let resp = self
             .http
             .get(url)
@@ -102,7 +121,8 @@ impl MoonvyApi {
         }
         let bytes = resp.bytes().await.context("failed to read genome body")?;
         if bytes.starts_with(b"{") || bytes.starts_with(b"[") {
-            return serde_json::from_slice(&bytes).map_err(|e| anyhow!("genome is not valid JSON: {e}"));
+            return serde_json::from_slice(&bytes)
+                .map_err(|e| anyhow!("genome is not valid JSON: {e}"));
         }
         let decompressed = flate2::read::GzDecoder::new(bytes.as_ref());
         serde_json::from_reader(decompressed).context("failed to decompress genome")
@@ -124,7 +144,11 @@ impl MoonvyApi {
         Ok(bytes.to_vec())
     }
 
-    async fn post<T: serde::de::DeserializeOwned>(&self, path: &str, body: &Value) -> anyhow::Result<T> {
+    async fn post<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &Value,
+    ) -> anyhow::Result<T> {
         let resp = self
             .http
             .post(format!("{}{}", self.base, path))
@@ -137,7 +161,15 @@ impl MoonvyApi {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(anyhow!("moonvy api {path} returned {status}: {}", text.chars().take(200).collect::<String>()));
+            if status.as_u16() == 401 {
+                return Err(anyhow!(
+                    "[AUTH_REQUIRED] moonvy api {path} returned 401. Call moonvy_login, or set MOONVY_TOKEN / run moonvy_set_token."
+                ));
+            }
+            return Err(anyhow!(
+                "moonvy api {path} returned {status}: {}",
+                text.chars().take(200).collect::<String>()
+            ));
         }
         serde_json::from_str(&text).with_context(|| format!("moonvy api {path} returned non-JSON"))
     }
@@ -157,7 +189,11 @@ pub fn parse_moonvy_url(url: &str) -> Option<MoonvyUrl> {
     let project_id = rest.first()?.to_string();
     let dir_id = rest.get(1).map(|s| s.to_string());
     let file_id = rest.get(2).map(|s| s.to_string());
-    Some(MoonvyUrl { project_id, dir_id, file_id })
+    Some(MoonvyUrl {
+        project_id,
+        dir_id,
+        file_id,
+    })
 }
 
 pub fn file_url_for(project_id: &str, parent_id: Option<&str>, id: &str) -> String {
@@ -195,7 +231,13 @@ mod tests {
 
     #[test]
     fn file_url_construction() {
-        assert_eq!(file_url_for("p", Some("d"), "f"), "https://moonvy.com/project/p/d/f");
-        assert_eq!(file_url_for("p", None, "f"), "https://moonvy.com/project/p/f");
+        assert_eq!(
+            file_url_for("p", Some("d"), "f"),
+            "https://moonvy.com/project/p/d/f"
+        );
+        assert_eq!(
+            file_url_for("p", None, "f"),
+            "https://moonvy.com/project/p/f"
+        );
     }
 }
