@@ -426,8 +426,11 @@ impl MoonvyServer {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for MoonvyServer {
     fn get_info(&self) -> ServerInfo {
+        let mut implementation = Implementation::from_build_env();
+        implementation.name = "openmoonvy-mcp-rs".to_string();
+        implementation.version = env!("CARGO_PKG_VERSION").to_string();
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::from_build_env())
+            .with_server_info(implementation)
             .with_instructions(
                 "Moonvy design extraction server (Rust). Requires a Moonvy auth token: \
                  set MOONVY_TOKEN or save ~/.moonvy-ai/token.json. \
