@@ -185,7 +185,7 @@ pub struct GradientStopStyle {
 }
 
 fn clamp_u8(value: f64) -> u8 {
-    (value.clamp(0.0, 255.0)).round() as u8
+    value.clamp(0.0, 255.0).round() as u8
 }
 
 pub fn resolve_fill_color(fill: Option<&Fill>) -> Option<String> {
@@ -599,6 +599,8 @@ pub fn diff_trees(a: &[TreeNode], b: &[TreeNode]) -> TreeDiff {
     TreeDiff { added, removed, changed }
 }
 
+/* -------------------------------- misc helpers ----------------------------- */
+
 pub fn ids_equal(a: Option<&str>, b: Option<&str>) -> bool {
     let (Some(a), Some(b)) = (a, b) else { return false };
     let a = a.trim();
@@ -675,7 +677,7 @@ pub fn extract_tokens(genome: &Genome) -> Tokens {
         }
     }
 
-    fn walk(node: &GenomeNode, genome: &Genome, colors: &mut Vec<String>, font_sizes: &mut Vec<f64>, radii: &mut Vec<i64>, spacing: &mut Vec<i64>) {
+    fn walk(node: &GenomeNode, colors: &mut Vec<String>, font_sizes: &mut Vec<f64>, radii: &mut Vec<i64>, spacing: &mut Vec<i64>) {
         for fill in &node.fills {
             if let Some(c) = resolve_fill_color(Some(fill)) {
                 push_unique(colors, c);
@@ -707,7 +709,7 @@ pub fn extract_tokens(genome: &Genome) -> Tokens {
             }
         }
         for child in &node.children {
-            walk(child, genome, colors, font_sizes, radii, spacing);
+            walk(child, colors, font_sizes, radii, spacing);
         }
     }
 
@@ -721,7 +723,7 @@ pub fn extract_tokens(genome: &Genome) -> Tokens {
         }
     }
     for page in &genome.pages {
-        walk(page, genome, &mut colors, &mut font_sizes, &mut radii, &mut spacing);
+        walk(page, &mut colors, &mut font_sizes, &mut radii, &mut spacing);
     }
 
     colors.sort();
@@ -730,4 +732,285 @@ pub fn extract_tokens(genome: &Genome) -> Tokens {
     spacing.retain(|s| *s > 0);
     spacing.sort_unstable();
     Tokens { colors, font_sizes, radii, spacing }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_genome() -> Genome {
+        Genome {
+            pages: vec![
+                GenomeNode {
+                    id: Some("1:0".into()),
+                    name: Some("Home".into()),
+                    rect: Some(Rect { x: 0.0, y: 0.0, w: 1440.0, h: 900.0 }),
+                    children: vec![GenomeNode {
+                        id: Some("1:1".into()),
+                        name: Some("Header".into()),
+                        r#type: Some("frame".into()),
+                        rect: Some(Rect { x: 0.0, y: 0.0, w: 1440.0, h: 80.0 }),
+                        fills: vec![Fill { r#type: Some("color".into()), color: Some(Color { r: 255.0, g: 0.0, b: 0.0, alpha: None }), opacity: Some(1.0), ..Default::default() }],
+                        children: vec![
+                            GenomeNode {
+                                id: Some("1:2".into()),
+                                name: Some("Logo".into()),
+                                r#type: Some("text".into()),
+                                rect: Some(Rect { x: 20.0, y: 24.0, w: 100.0, h: 32.0 }),
+                                textbox: Some(Textbox {
+                                    text: Some("LOGO".into()),
+                                    segments: vec![TextSegment {
+                                        font_size: Some(16.0),
+                                        font_weight: Some(700.0),
+                                        font_name: Some(FontName { family: Some("Inter".into()) }),
+                                        fills: vec![Fill { r#type: Some("color".into()), color: Some(Color { r: 0.0, g: 0.0, b: 0.0, alpha: None }), ..Default::default() }],
+                                        ..Default::default()
+                                    }],
+                                }),
+                                ..Default::default()
+                            },
+                            GenomeNode {
+                                id: Some("1:3".into()),
+                                name: Some("Btn".into()),
+                                r#type: Some("rectangle".into()),
+                                rect: Some(Rect { x: 1300.0, y: 16.0, w: 100.0, h: 48.0 }),
+                                border_radius: Some(8.0),
+                                fills: vec![Fill { r#type: Some("color".into()), color: Some(Color { r: 0.0, g: 0.0, b: 255.0, alpha: None }), opacity: Some(1.0), ..Default::default() }],
+                                ..Default::default()
+                            },
+                        ],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                GenomeNode {
+                    id: Some("2:0".into()),
+                    name: Some("About".into()),
+                    rect: Some(Rect { x: 0.0, y: 0.0, w: 1024.0, h: 768.0 }),
+                    ..Default::default()
+                },
+            ],
+            styles: Some(Styles { fill_styles: vec![] }),
+            images: Default::default(),
+        }
+    }
+
+    fn chain_genome() -> Genome {
+        Genome {
+            pages: vec![GenomeNode {
+                id: Some("p:0".into()),
+                name: Some("Page".into()),
+                r#type: Some("page".into()),
+                rect: Some(Rect { x: 100.0, y: 200.0, w: 1440.0, h: 900.0 }),
+                children: vec![GenomeNode {
+                    id: Some("g:1".into()),
+                    name: Some("group1".into()),
+                    r#type: Some("group".into()),
+                    rect: Some(Rect { x: 10.0, y: 20.0, w: 800.0, h: 600.0 }),
+                    children: vec![GenomeNode {
+                        id: Some("g:2".into()),
+                        name: Some("group2".into()),
+                        r#type: Some("group".into()),
+                        rect: Some(Rect { x: 30.0, y: 40.0, w: 500.0, h: 400.0 }),
+                        children: vec![
+                            GenomeNode {
+                                id: Some("t:1".into()),
+                                name: Some("Title".into()),
+                                r#type: Some("text".into()),
+                                rect: Some(Rect { x: 5.0, y: 5.0, w: 200.0, h: 40.0 }),
+                                textbox: Some(Textbox { text: Some("Hello".into()), ..Default::default() }),
+                                ..Default::default()
+                            },
+                            GenomeNode {
+                                id: Some("i:1".into()),
+                                name: Some("Icon".into()),
+                                r#type: Some("frame".into()),
+                                rect: Some(Rect { x: 60.0, y: 60.0, w: 50.0, h: 50.0 }),
+                                fills: vec![Fill { r#type: Some("color".into()), color: Some(Color { r: 1.0, g: 2.0, b: 3.0, alpha: None }), opacity: Some(1.0), ..Default::default() }],
+                                ..Default::default()
+                            },
+                        ],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            styles: None,
+            images: Default::default(),
+        }
+    }
+
+    #[test]
+    fn ids_equal_exact_and_compound() {
+        assert!(ids_equal(Some("4:1221"), Some("4:1221")));
+        assert!(ids_equal(Some("I4:1222;4:1005;4:69"), Some("4:69")));
+        assert!(ids_equal(Some("I4:1222;4:1005;4:69"), Some("4:1005")));
+        assert!(!ids_equal(Some("1:1"), Some("1:1x")));
+        assert!(!ids_equal(Some("1:1"), Some("1:11")));
+        assert!(ids_equal(Some("1:1"), Some("1:1;2:3")));
+        assert!(!ids_equal(None, Some("1:1")));
+        assert!(!ids_equal(Some(""), Some("")));
+    }
+
+    #[test]
+    fn style_stroke_and_gradient() {
+        let genome = sample_genome();
+        let stroke_node = GenomeNode {
+            r#type: Some("rectangle".into()),
+            rect: Some(Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }),
+            fills: vec![Fill { r#type: Some("color".into()), color: Some(Color { r: 255.0, g: 0.0, b: 0.0, alpha: None }), opacity: Some(1.0), ..Default::default() }],
+            strokes: vec![Stroke { fills: vec![Fill { r#type: Some("color".into()), color: Some(Color { r: 0.0, g: 0.0, b: 0.0, alpha: None }), opacity: Some(1.0), ..Default::default() }], w: Some(1.6) }],
+            ..Default::default()
+        };
+        let style = extract_raw_node_style(&genome, &stroke_node);
+        assert_eq!(style.stroke_width, Some(1.6));
+        assert_eq!(style.stroke_color.as_deref(), Some("#000000"));
+        assert!(style.gradient.is_none());
+
+        let grad_node = GenomeNode {
+            r#type: Some("rectangle".into()),
+            rect: Some(Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }),
+            fills: vec![Fill {
+                r#type: Some("gradient".into()),
+                gradient: Some(Gradient {
+                    r#type: Some("linear".into()),
+                    stops: vec![
+                        GradientStop { color: Some(Color { r: 255.0, g: 162.0, b: 55.0, alpha: Some(1.0) }), position: Some(0.0) },
+                        GradientStop { color: Some(Color { r: 0.0, g: 0.0, b: 0.0, alpha: Some(1.0) }), position: Some(1.0) },
+                    ],
+                    angle: Some(90.0),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let style = extract_raw_node_style(&genome, &grad_node);
+        assert!(style.background.is_none());
+        assert_eq!(style.gradient.as_ref().map(|g| g.r#type.as_str()), Some("linear"));
+        assert_eq!(style.gradient.as_ref().map(|g| g.stops.len()), Some(2));
+        assert_eq!(style.gradient.as_ref().map(|g| g.stops[0].color.as_str()), Some("rgba(255,162,55,1)"));
+        assert_eq!(style.gradient.as_ref().and_then(|g| g.angle), Some(90.0));
+    }
+
+    #[test]
+    fn tree_skip_empty_groups() {
+        let genome = chain_genome();
+        let full = extract_tree(&genome, None, &TreeOptions::default());
+        assert_eq!(full[0].children.as_ref().unwrap()[0].name, "group1");
+
+        let options = TreeOptions { skip_empty_groups: true, ..Default::default() };
+        let filtered = extract_tree(&genome, None, &options);
+        let children = filtered[0].children.as_ref().unwrap();
+        assert_eq!(children[0].name, "Title");
+        assert_eq!(children[1].name, "Icon");
+    }
+
+    #[test]
+    fn tree_flatten_coordinates() {
+        let genome = chain_genome();
+        let options = TreeOptions { flatten: true, ..Default::default() };
+        let flat = extract_tree(&genome, None, &options);
+        let page = &flat[0];
+        assert_eq!(page.x, 0, "artboard origin zeroed");
+        assert_eq!(page.y, 0);
+        let icon = &page.children.as_ref().unwrap()[0].children.as_ref().unwrap()[0].children.as_ref().unwrap()[1];
+        assert_eq!(icon.x, 10 + 30 + 60, "nested offsets accumulated");
+        assert_eq!(icon.y, 20 + 40 + 60);
+    }
+
+    #[test]
+    fn tree_only_filter() {
+        let genome = chain_genome();
+        let options = TreeOptions { only: Some(vec!["text".into()]), ..Default::default() };
+        let texts = extract_tree(&genome, None, &options);
+        assert_eq!(texts.len(), 1);
+        assert_eq!(texts[0].id, "t:1");
+    }
+
+    #[test]
+    fn tree_detect_duplicates() {
+        let genome = Genome {
+            pages: vec![GenomeNode {
+                id: Some("p:0".into()),
+                name: Some("Page".into()),
+                r#type: Some("page".into()),
+                rect: Some(Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }),
+                children: vec![
+                    GenomeNode {
+                        id: Some("a:1".into()),
+                        name: Some("Btn".into()),
+                        r#type: Some("frame".into()),
+                        rect: Some(Rect { x: 0.0, y: 0.0, w: 50.0, h: 50.0 }),
+                        fills: vec![Fill { r#type: Some("color".into()), color: Some(Color { r: 1.0, g: 2.0, b: 3.0, alpha: None }), opacity: Some(1.0), ..Default::default() }],
+                        ..Default::default()
+                    },
+                    GenomeNode {
+                        id: Some("a:2".into()),
+                        name: Some("Btn".into()),
+                        r#type: Some("frame".into()),
+                        rect: Some(Rect { x: 60.0, y: 0.0, w: 50.0, h: 50.0 }),
+                        fills: vec![Fill { r#type: Some("color".into()), color: Some(Color { r: 1.0, g: 2.0, b: 3.0, alpha: None }), opacity: Some(1.0), ..Default::default() }],
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            styles: None,
+            images: Default::default(),
+        };
+        let options = TreeOptions { with_style: true, detect_duplicates: true, ..Default::default() };
+        let tree = extract_tree(&genome, None, &options);
+        let second = &tree[0].children.as_ref().unwrap()[1];
+        assert_eq!(second.duplicate_of.as_deref(), Some("a:1"));
+    }
+
+    #[test]
+    fn tokens_colors_fonts_radii() {
+        let tokens = extract_tokens(&sample_genome());
+        assert!(tokens.colors.contains(&"#ff0000".to_string()));
+        assert!(tokens.colors.contains(&"#000000".to_string()));
+        assert_eq!(tokens.font_sizes, vec![16.0]);
+        assert_eq!(tokens.radii, vec![8]);
+        assert!(tokens.spacing.iter().all(|s| *s > 0));
+    }
+
+    #[test]
+    fn layers_limit_and_frame_filter() {
+        let genome = sample_genome();
+        assert_eq!(extract_layers(&genome, None, 50).len(), 5);
+        assert_eq!(extract_layers(&genome, Some("1:0"), 50).len(), 4);
+        assert_eq!(extract_layers(&genome, Some("1:0"), 2).len(), 2);
+        assert_eq!(extract_layers(&genome, Some("missing"), 50).len(), 0);
+    }
+
+    #[test]
+    fn design_meta_title_and_frames() {
+        let meta = extract_design_meta(&sample_genome(), None);
+        assert_eq!(meta.title, "Home");
+        assert_eq!(meta.frame_count, 2);
+        assert_eq!(meta.frames[0].name, "Home");
+        assert_eq!(meta.frames[0].width, 1440);
+    }
+
+    #[test]
+    fn diff_added_removed_changed() {
+        let a = vec![
+            TreeNode { id: "1".into(), name: "A".into(), r#type: "frame".into(), x: 0, y: 0, width: 10, height: 10, text: Some("same".into()), ..Default::default() },
+            TreeNode { id: "3".into(), name: "C".into(), r#type: "frame".into(), x: 0, y: 0, width: 10, height: 10, ..Default::default() },
+        ];
+        let b = vec![
+            TreeNode { id: "1".into(), name: "A".into(), r#type: "frame".into(), x: 0, y: 0, width: 10, height: 10, text: Some("changed".into()), ..Default::default() },
+            TreeNode { id: "4".into(), name: "D".into(), r#type: "frame".into(), x: 0, y: 0, width: 10, height: 10, ..Default::default() },
+        ];
+        let diff = diff_trees(&a, &b);
+        assert_eq!(diff.removed.len(), 1);
+        assert_eq!(diff.removed[0].id, "3");
+        assert_eq!(diff.added.len(), 1);
+        assert_eq!(diff.added[0].id, "4");
+        assert_eq!(diff.changed.len(), 1);
+        assert_eq!(diff.changed[0].id, "1");
+        assert_eq!(diff.changed[0].fields, vec!["text"]);
+    }
 }

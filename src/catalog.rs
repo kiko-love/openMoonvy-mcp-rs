@@ -161,3 +161,70 @@ pub fn resolve_workspace_dir(dir: &str) -> anyhow::Result<PathBuf> {
     }
     Ok(path)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_catalog() -> Catalog {
+        serde_json::from_str(
+            r#"{
+            "version": 1,
+            "designs": [
+              {"id":"1","name":"Home","type":"design","url":"https://moonvy.com/project/1","projectId":"","parentId":"","aliases":[],"tags":[]},
+              {"id":"2","name":"Login","type":"design","url":"https://moonvy.com/project/2","projectId":"","parentId":"","aliases":[],"tags":[]},
+              {"id":"3","name":"Dashboard","type":"design","url":"https://moonvy.com/project/3","projectId":"","parentId":"","aliases":[],"tags":["overview"]}
+            ]
+          }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn search_exact_and_missing() {
+        let catalog = sample_catalog();
+        let aliases: HashMap<String, serde_json::Value> = HashMap::new();
+
+        let exact = search_catalog(&catalog, &aliases, "Home");
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].match_reason, "exact");
+        assert_eq!(exact[0].score, 100);
+
+        let missing = search_catalog(&catalog, &aliases, "nope");
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn search_via_aliases() {
+        let catalog = sample_catalog();
+        let mut aliases: HashMap<String, serde_json::Value> = HashMap::new();
+        aliases.insert("home.vue".into(), serde_json::json!("Home"));
+        let matches = search_catalog(&catalog, &aliases, "home.vue");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].match_reason, "alias-map");
+        assert_eq!(matches[0].score, 80);
+    }
+
+    #[test]
+    fn search_ranking_exact_over_contains() {
+        let catalog = sample_catalog();
+        let aliases: HashMap<String, serde_json::Value> = HashMap::new();
+        let mut c = catalog.clone();
+        c.designs[2].name = "Home Dashboard".to_string();
+        let matches = search_catalog(&c, &aliases, "Home");
+        assert_eq!(matches[0].score, 100, "exact match ranks first");
+        assert_eq!(matches[0].match_reason, "exact");
+    }
+
+    #[test]
+    fn catalog_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("moonvy-cat-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(MOONVY_DIR)).unwrap();
+        let catalog = sample_catalog();
+        catalog.save(&dir).unwrap();
+        let loaded = Catalog::load(&dir).unwrap();
+        assert_eq!(loaded.designs.len(), 3);
+        assert_eq!(loaded.designs[0].name, "Home");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}

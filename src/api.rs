@@ -166,3 +166,36 @@ pub fn file_url_for(project_id: &str, parent_id: Option<&str>, id: &str) -> Stri
         None => format!("https://moonvy.com/project/{project_id}/{id}"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_moonvy_url_full() {
+        let url = parse_moonvy_url("https://moonvy.com/project/p1/d1/f1").unwrap();
+        assert_eq!(url.project_id, "p1");
+        assert_eq!(url.dir_id.as_deref(), Some("d1"));
+        assert_eq!(url.file_id.as_deref(), Some("f1"));
+    }
+
+    #[test]
+    fn parse_moonvy_url_dir_only() {
+        let url = parse_moonvy_url("https://moonvy.com/project/p1/d1").unwrap();
+        assert_eq!(url.project_id, "p1");
+        assert_eq!(url.dir_id.as_deref(), Some("d1"));
+        assert!(url.file_id.is_none());
+    }
+
+    #[test]
+    fn parse_moonvy_url_invalid() {
+        assert!(parse_moonvy_url("https://evil.com/x").is_none());
+        assert!(parse_moonvy_url("not-a-url").is_none());
+    }
+
+    #[test]
+    fn file_url_construction() {
+        assert_eq!(file_url_for("p", Some("d"), "f"), "https://moonvy.com/project/p/d/f");
+        assert_eq!(file_url_for("p", None, "f"), "https://moonvy.com/project/p/f");
+    }
+}
