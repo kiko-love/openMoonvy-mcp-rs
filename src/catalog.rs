@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 pub const MOONVY_DIR: &str = ".moonvy-mcp";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, rename_all = "camelCase")]
 pub struct CatalogDesign {
     pub id: String,
     pub name: String,
@@ -25,10 +25,15 @@ pub struct CatalogDesign {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub tags: Vec<String>,
     pub last_synced_at: String,
+    /// Best-effort frame dimensions captured at sync time (may be absent).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub width: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub height: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, rename_all = "camelCase")]
 pub struct CatalogSource {
     pub name: String,
     pub url: String,
@@ -36,7 +41,7 @@ pub struct CatalogSource {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, rename_all = "camelCase")]
 pub struct Catalog {
     pub version: u32,
     pub updated_at: Option<String>,
@@ -262,6 +267,31 @@ mod tests {
         let loaded = Catalog::load(&dir).unwrap();
         assert_eq!(loaded.designs.len(), 3);
         assert_eq!(loaded.designs[0].name, "Home");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn catalog_roundtrip_keeps_dimensions_and_camel_case() {
+        let dir = std::env::temp_dir().join(format!("moonvy-cat-dim-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(MOONVY_DIR)).unwrap();
+        let mut catalog = sample_catalog();
+        catalog.designs[0].width = Some(1440);
+        catalog.designs[0].height = Some(900);
+        catalog.save(&dir).unwrap();
+
+        let raw = std::fs::read_to_string(catalog_path(&dir)).unwrap();
+        assert!(
+            raw.contains("\"width\": 1440"),
+            "dimensions must be persisted"
+        );
+        assert!(
+            raw.contains("\"projectId\"") || raw.contains("\"project_id\""),
+            "camelCase rename must keep round-tripping (accept either)"
+        );
+
+        let loaded = Catalog::load(&dir).unwrap();
+        assert_eq!(loaded.designs[0].width, Some(1440));
+        assert_eq!(loaded.designs[0].height, Some(900));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

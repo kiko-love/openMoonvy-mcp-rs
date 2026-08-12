@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Moonvy genome data structures and parsing.
  *
  * Node shapes, style normalization and tree options
@@ -123,9 +123,7 @@ where
     Ok(match value {
         None => None,
         Some(serde_json::Value::Number(n)) => n.as_f64(),
-        Some(serde_json::Value::Array(radii)) => {
-            radii.first().and_then(serde_json::Value::as_f64)
-        }
+        Some(serde_json::Value::Array(radii)) => radii.first().and_then(serde_json::Value::as_f64),
         _ => None,
     })
 }
@@ -357,9 +355,9 @@ pub fn extract_raw_node_style(genome: &Genome, raw: &GenomeNode) -> NodeStyle {
     let mut letter_spacing = None;
     if let Some(seg) = raw.textbox.as_ref().and_then(|t| t.segments.first()) {
         font_size = seg.font_size;
-        font_weight = seg.font_weight.or_else(|| {
-            style_to_weight(seg.font_name.as_ref().and_then(|f| f.style.as_deref()))
-        });
+        font_weight = seg
+            .font_weight
+            .or_else(|| style_to_weight(seg.font_name.as_ref().and_then(|f| f.style.as_deref())));
         font_family = seg.font_name.as_ref().and_then(|f| f.family.clone());
         line_height = seg.line_height.as_ref().and_then(|l| l.value);
         letter_spacing = seg.letter_spacing.as_ref().and_then(|l| l.value);
@@ -408,6 +406,10 @@ pub struct TreeNode {
     pub children: Option<Vec<TreeNode>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duplicate_of: Option<String>,
+    /// True when this container holds a clipping shape child (blend.isMask /
+    /// isPureMask): it is a mask group whose children are clipped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_mask_group: Option<bool>,
     /// Rendered preview hash of this node (its own snapshot / snapshotPreview).
     /// Resolves against the `assets` manifest (includeAssets) or
     /// https://fs.moonvy.com/{hash}.
@@ -489,10 +491,11 @@ impl Default for TreeOptions {
 
 /// A container is "empty" (pure nesting noise) only if it carries no visual
 /// content AND no mask semantics: mask groups hold a clipping shape child
-/// (`blend.isMask`) that must survive skipEmptyGroups, and the clipping shape
-/// itself must not be dropped as an empty leaf.
+/// (`blend.isMask` / `isPureMask`) that must survive skipEmptyGroups, and the
+/// clipping shape itself must not be dropped as an empty leaf.
 fn is_empty_container(raw: &GenomeNode) -> bool {
-    let no_content = raw.textbox
+    let no_content = raw
+        .textbox
         .as_ref()
         .and_then(|t| t.text.as_deref())
         .is_none()
@@ -501,13 +504,19 @@ fn is_empty_container(raw: &GenomeNode) -> bool {
         && raw.slices.is_none()
         && raw.snapshot.is_none()
         && raw.snapshot_preview.is_none();
-    let is_mask_shape = raw.blend.as_ref().is_some_and(|b| b.is_mask == Some(true));
+    let is_mask_shape = raw.blend.as_ref().is_some_and(has_mask_marker);
     no_content
         && !is_mask_shape
         && !raw
             .children
             .iter()
-            .any(|c| c.blend.as_ref().is_some_and(|b| b.is_mask == Some(true)))
+            .any(|c| c.blend.as_ref().is_some_and(has_mask_marker))
+}
+
+/// Mask markers found on the clipping shape child of a mask group: real
+/// genome data may carry `isMask` and/or `isPureMask`.
+fn has_mask_marker(blend: &Blend) -> bool {
+    blend.is_mask == Some(true) || blend.is_pure_mask == Some(true)
 }
 
 fn node_signature(raw: &GenomeNode, style: Option<&NodeStyle>) -> String {
@@ -607,6 +616,12 @@ pub fn extract_tree(
             },
             children: None,
             duplicate_of: None,
+            is_mask_group: (!raw.children.is_empty()
+                && raw
+                    .children
+                    .iter()
+                    .any(|c| c.blend.as_ref().is_some_and(has_mask_marker)))
+            .then_some(true),
             snapshot_hash: raw
                 .snapshot
                 .clone()
@@ -681,6 +696,7 @@ pub fn extract_tree(
                             style: None,
                             children: None,
                             duplicate_of: node.duplicate_of.clone(),
+                            is_mask_group: None,
                             snapshot_hash: None,
                         }];
                     }
@@ -774,10 +790,28 @@ pub struct SearchHit {
     pub height: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// Nearest ancestor that is a component-like container (group/artboard/
+    /// frame/component). Lets the caller drill into the whole component
+    /// subtree with get_tree(nodeId) instead of the whole page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_type: Option<String>,
+}
+
+fn is_component_container(node: &GenomeNode) -> bool {
+    matches!(
+        node.r#type.as_deref(),
+        Some("group" | "artboard" | "frame" | "component" | "section")
+    )
 }
 
 /// Case-insensitive substring search over node names and text contents.
 /// Returns depth-first matches (parents before children), truncated by limit.
+/// Each hit carries its nearest component-like ancestor so callers can jump
+/// straight to the containing component subtree.
 pub fn find_nodes(
     genome: &Genome,
     frame_filter: Option<&str>,
@@ -793,8 +827,9 @@ pub fn find_nodes(
         if frame_filter.is_some() && !ids_equal(page.id.as_deref(), frame_filter) {
             continue;
         }
-        let mut stack: Vec<&GenomeNode> = vec![page];
-        while let Some(node) = stack.pop() {
+        // Stack entries: (node, nearest component-like ancestor seen so far).
+        let mut stack: Vec<(&GenomeNode, Option<&GenomeNode>)> = vec![(page, None)];
+        while let Some((node, container)) = stack.pop() {
             let text = node.textbox.as_ref().and_then(|t| t.text.clone());
             let name = node.name.clone().unwrap_or_default();
             let matches = name.to_lowercase().contains(&query)
@@ -812,15 +847,25 @@ pub fn find_nodes(
                     width: rect.w.round() as i64,
                     height: rect.h.round() as i64,
                     text,
+                    container_id: container.and_then(|c| c.id.clone()),
+                    container_name: container.and_then(|c| c.name.clone()),
+                    container_type: container
+                        .and_then(|c| c.r#type.clone())
+                        .or_else(|| container.map(|_| "container".to_string())),
                 });
                 if hits.len() >= limit {
                     return hits;
                 }
             }
+            let next_container = if is_component_container(node) {
+                Some(node)
+            } else {
+                container
+            };
             // Depth-first with LIFO stack: push children in reverse so the
             // first child is visited first (parents already matched above).
             for child in node.children.iter().rev() {
-                stack.push(child);
+                stack.push((child, next_container));
             }
         }
     }
@@ -969,13 +1014,26 @@ fn strip_children(mut node: TreeNode) -> TreeNode {
 /// whose ids differ across designs (e.g. two separate pages for normal vs
 /// hover states). Returns (paired_changes, added, removed).
 pub fn diff_trees(a: &[TreeNode], b: &[TreeNode]) -> TreeDiff {
-    let by_id_a: HashMap<String, &TreeNode> =
-        flatten_tree(a).into_iter().map(|n| (n.id.clone(), n)).collect();
-    let by_id_b: HashMap<String, &TreeNode> =
-        flatten_tree(b).into_iter().map(|n| (n.id.clone(), n)).collect();
+    let by_id_a: HashMap<String, &TreeNode> = flatten_tree(a)
+        .into_iter()
+        .map(|n| (n.id.clone(), n))
+        .collect();
+    let by_id_b: HashMap<String, &TreeNode> = flatten_tree(b)
+        .into_iter()
+        .map(|n| (n.id.clone(), n))
+        .collect();
     let mut matched_a: HashSet<String> = HashSet::new();
     let mut changed = Vec::new();
     let mut added = Vec::new();
+
+    // Roots are the tree's top-level nodes (pages/artboards). When both sides
+    // are single-page designs with the same viewport size, the page container
+    // is just a different uuid/name wrapper — reporting it as added/removed is
+    // noise; its real changes surface through the children.
+    let root_ids_a: HashSet<&str> = a.iter().map(|n| n.id.as_str()).collect();
+    let root_ids_b: HashSet<&str> = b.iter().map(|n| n.id.as_str()).collect();
+    let single_page_match =
+        a.len() == 1 && b.len() == 1 && a[0].width == b[0].width && a[0].height == b[0].height;
 
     // Name -> ids of unmatched A nodes (built once, used only for fallback).
     let mut by_name: HashMap<&str, Vec<&String>> = HashMap::new();
@@ -986,10 +1044,10 @@ pub fn diff_trees(a: &[TreeNode], b: &[TreeNode]) -> TreeDiff {
     }
 
     let record_change = |matched: &mut HashSet<String>,
-                             changed: &mut Vec<ChangedNode>,
-                             node_a: &TreeNode,
-                             node_b: &TreeNode,
-                             a_id: String| {
+                         changed: &mut Vec<ChangedNode>,
+                         node_a: &TreeNode,
+                         node_b: &TreeNode,
+                         a_id: String| {
         matched.insert(a_id);
         if let Some(fields) = changed_fields(node_a, node_b) {
             changed.push(ChangedNode {
@@ -1009,33 +1067,165 @@ pub fn diff_trees(a: &[TreeNode], b: &[TreeNode]) -> TreeDiff {
         }
     }
     // Pass 2: same-name fallback for ids that could not be paired by id.
-    for (id, node_b) in &by_id_b {
-        if matched_a.contains(id) {
+    // When several A nodes share a name, solve the assignment with the
+    // Hungarian algorithm (minimum total geometry distance) and require the
+    // same node type — arbitrary first-unmatched pairing cross-matches
+    // unrelated same-name nodes (e.g. icon 1 <-> icon 2) and floods the diff
+    // with fake `rect` changes.
+    const COST_INF: i64 = i64::MAX / 4;
+
+    fn geo_distance(a: &TreeNode, b: &TreeNode) -> i64 {
+        (a.x - b.x).saturating_pow(2)
+            + (a.y - b.y).saturating_pow(2)
+            + (a.width - b.width).saturating_pow(2)
+            + (a.height - b.height).saturating_pow(2)
+    }
+
+    /// Hungarian algorithm (minimum-cost perfect matching, O(n^3)).
+    /// `cost` is n x n; returns for each row the assigned column.
+    fn hungarian_min(cost: &[Vec<i64>]) -> Vec<usize> {
+        let n = cost.len();
+        let mut u = vec![0i64; n + 1];
+        let mut v = vec![0i64; n + 1];
+        let mut p = vec![0usize; n + 1];
+        let mut way = vec![0usize; n + 1];
+        for i in 1..=n {
+            p[0] = i;
+            let mut j0 = 0usize;
+            let mut minv = vec![i64::MAX; n + 1];
+            let mut used = vec![false; n + 1];
+            loop {
+                used[j0] = true;
+                let i0 = p[j0];
+                let mut delta = i64::MAX;
+                let mut j1 = 0usize;
+                for j in 1..=n {
+                    if !used[j] {
+                        let cur = cost[i0 - 1][j - 1] - u[i0] - v[j];
+                        if cur < minv[j] {
+                            minv[j] = cur;
+                            way[j] = j0;
+                        }
+                        if minv[j] < delta {
+                            delta = minv[j];
+                            j1 = j;
+                        }
+                    }
+                }
+                for j in 0..=n {
+                    if used[j] {
+                        u[p[j]] += delta;
+                        v[j] -= delta;
+                    } else {
+                        minv[j] -= delta;
+                    }
+                }
+                j0 = j1;
+                if p[j0] == 0 {
+                    break;
+                }
+            }
+            loop {
+                let j1 = way[j0];
+                p[j0] = p[j1];
+                j0 = j1;
+                if j0 == 0 {
+                    break;
+                }
+            }
+        }
+        let mut assign = vec![0usize; n];
+        for j in 1..=n {
+            if p[j] != 0 {
+                assign[p[j] - 1] = j - 1;
+            }
+        }
+        assign
+    }
+
+    let push_added = |added: &mut Vec<TreeNode>, node_b: &TreeNode| {
+        let is_page_wrapper = single_page_match
+            && is_page_container(node_b)
+            && root_ids_b.contains(node_b.id.as_str());
+        if !is_page_wrapper {
+            added.push(strip_children(node_b.clone()));
+        }
+    };
+
+    // Unmatched B nodes grouped by name (deterministic order).
+    let mut b_sorted: Vec<(&String, &&TreeNode)> = by_id_b
+        .iter()
+        .filter(|(id, _)| !matched_a.contains(*id))
+        .collect();
+    b_sorted.sort_by_key(|(ida, _)| *ida);
+    let mut b_by_name: HashMap<&str, Vec<(&String, &&TreeNode)>> = HashMap::new();
+    for (id, node) in b_sorted {
+        if node.name.is_empty() {
+            push_added(&mut added, node);
+        } else {
+            b_by_name
+                .entry(node.name.as_str())
+                .or_default()
+                .push((id, node));
+        }
+    }
+
+    for (name, b_group) in b_by_name {
+        let candidates: Vec<(&String, &TreeNode)> = by_name
+            .get(name)
+            .map(|ids| {
+                let mut v: Vec<(&String, &TreeNode)> = ids
+                    .iter()
+                    .filter(|a_id| !matched_a.contains(**a_id))
+                    .map(|a_id| (*a_id, by_id_a[*a_id]))
+                    .collect();
+                v.sort_by_key(|(ida, _)| *ida);
+                v
+            })
+            .unwrap_or_default();
+        if candidates.is_empty() {
+            for (_, node) in &b_group {
+                push_added(&mut added, node);
+            }
             continue;
         }
-        let matched_id = if node_b.name.is_empty() {
-            None
-        } else {
-            by_name
-                .get(node_b.name.as_str())
-                .and_then(|candidates| {
-                    candidates
-                        .iter()
-                        .find(|a_id| !matched_a.contains(**a_id))
-                        .map(|a_id| (**a_id).clone())
-                })
-        };
-        match matched_id {
-            Some(a_id) => {
-                let node_a = by_id_a[&a_id];
-                record_change(&mut matched_a, &mut changed, node_a, node_b, a_id);
+        let nb = b_group.len();
+        let na = candidates.len();
+        let n = nb.max(na);
+        let mut cost = vec![vec![COST_INF; n]; n];
+        for (i, (_, node_b)) in b_group.iter().enumerate() {
+            for (j, (_, node_a)) in candidates.iter().enumerate() {
+                if node_a.r#type == node_b.r#type {
+                    cost[i][j] = geo_distance(node_a, node_b);
+                }
             }
-            None => added.push(strip_children((*node_b).clone())),
+        }
+        let assign = hungarian_min(&cost);
+        for (i, (_, node_b)) in b_group.iter().enumerate() {
+            let j = assign[i];
+            let paired = j < na && cost[i][j] < COST_INF;
+            if paired {
+                let (a_id, node_a) = &candidates[j];
+                record_change(
+                    &mut matched_a,
+                    &mut changed,
+                    node_a,
+                    node_b,
+                    (*a_id).clone(),
+                );
+            } else {
+                push_added(&mut added, node_b);
+            }
         }
     }
     let removed: Vec<TreeNode> = by_id_a
         .iter()
         .filter(|(id, _)| !matched_a.contains(*id))
+        .filter(|(id, _)| {
+            !(single_page_match
+                && is_page_container(by_id_a[id.as_str()])
+                && root_ids_a.contains(id.as_str()))
+        })
         .map(|(_, node)| strip_children((*node).clone()))
         .collect();
     TreeDiff {
@@ -1043,6 +1233,233 @@ pub fn diff_trees(a: &[TreeNode], b: &[TreeNode]) -> TreeDiff {
         removed,
         changed,
     }
+}
+
+/// True for page/artboard-level containers whose uuid changes across designs
+/// are pure wrapper noise (not real layout changes).
+fn is_page_container(node: &TreeNode) -> bool {
+    matches!(
+        node.r#type.as_str(),
+        "artboard" | "page" | "frame" | "canvas" | "board"
+    )
+}
+
+/* -------------------------------- style code ------------------------------ */
+
+/// Output format for moonvy_get_style_code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StyleCodeFormat {
+    #[default]
+    Css,
+    Tailwind,
+}
+
+impl StyleCodeFormat {
+    pub fn parse(s: Option<&str>) -> Option<Self> {
+        match s.map(str::to_lowercase).as_deref() {
+            None | Some("css") => Some(Self::Css),
+            Some("tailwind" | "tailwindcss" | "tw") => Some(Self::Tailwind),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StyleCodeItem {
+    pub id: String,
+    pub name: String,
+    /// CSS class / Tailwind-ready component label derived from the node name.
+    pub selector: String,
+    /// Generated style declaration (css block or tailwind class string).
+    pub code: String,
+}
+
+/// Tailwind spacing scale for sizes/radii: 4px steps map to w-*/h-*/rounded-*.
+fn tw_scale(px: f64) -> Option<String> {
+    let v = px / 4.0;
+    (v.fract() == 0.0 && (1.0..=24.0).contains(&v)).then(|| format!("{}", v as i64))
+}
+
+fn tw_size_class(prop: &str, px: f64) -> String {
+    match tw_scale(px) {
+        Some(n) => format!("{prop}-{n}"),
+        None => format!("{prop}-[{px}px]"),
+    }
+}
+
+/// Generate CSS / Tailwind snippets for a flattened tree. Nodes with no
+/// visual style (empty containers) collapse to a positioning-only line.
+pub fn generate_style_code(nodes: &[TreeNode], format: StyleCodeFormat) -> Vec<StyleCodeItem> {
+    fn class_name(node: &TreeNode) -> String {
+        let base: String = node
+            .name
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .take(24)
+            .collect();
+        let base = if base.is_empty() {
+            "node".to_string()
+        } else {
+            base
+        };
+        let suffix: String = node.id.chars().take(6).collect();
+        format!("{base}-{suffix}")
+    }
+
+    fn css_rule(node: &TreeNode, cls: &str) -> String {
+        let mut lines = vec![format!(".{cls} {{")];
+        if node.r#type == "artboard" {
+            lines.push("  position: relative;".to_string());
+        } else {
+            lines.push("  position: absolute;".to_string());
+            lines.push(format!("  left: {}px;", node.x));
+            lines.push(format!("  top: {}px;", node.y));
+        }
+        lines.push(format!("  width: {}px;", node.width));
+        lines.push(format!("  height: {}px;", node.height));
+        if let Some(style) = &node.style {
+            if let Some(bg) = &style.background {
+                lines.push(format!("  background: {bg};"));
+            }
+            if let Some(gradient) = &style.gradient {
+                let stops = gradient
+                    .stops
+                    .iter()
+                    .map(|s| format!("{} {}%", s.color, s.position * 100.0))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                lines.push(format!("  background: linear-gradient({stops});"));
+            }
+            if let Some(radius) = style.border_radius {
+                // A radius >= half the smaller side renders as a full circle
+                // (browsers clamp), so emit 50% instead of a raw px value.
+                let full = node.width.min(node.height) as f64 / 2.0;
+                let value = if radius >= full {
+                    "50%".to_string()
+                } else {
+                    format!("{radius}px")
+                };
+                lines.push(format!("  border-radius: {value};"));
+            }
+            if let (Some(color), Some(width)) = (&style.stroke_color, style.stroke_width) {
+                lines.push(format!("  border: {width}px solid {color};"));
+            }
+            if let Some(opacity) = style.opacity {
+                lines.push(format!("  opacity: {opacity};"));
+            }
+            if let Some(color) = &style.color {
+                lines.push(format!("  color: {color};"));
+            }
+            if let Some(size) = style.font_size {
+                lines.push(format!("  font-size: {size}px;"));
+            }
+            if let Some(weight) = style.font_weight {
+                let weight = weight.round() as i64;
+                lines.push(format!("  font-weight: {weight};"));
+            }
+            if let Some(height) = style.line_height {
+                lines.push(format!("  line-height: {height}px;"));
+            }
+            if let Some(family) = &style.font_family {
+                lines.push(format!("  font-family: '{family}';"));
+            }
+        }
+        lines.push("}".to_string());
+        lines.join("\n")
+    }
+
+    fn tw_rule(node: &TreeNode) -> String {
+        let mut classes = Vec::new();
+        if node.r#type != "artboard" {
+            classes.push("absolute".to_string());
+            classes.push(format!("left-[{}px]", node.x));
+            classes.push(format!("top-[{}px]", node.y));
+        } else {
+            classes.push("relative".to_string());
+        }
+        classes.push(tw_size_class("w", node.width as f64));
+        classes.push(tw_size_class("h", node.height as f64));
+        if let Some(style) = &node.style {
+            if let Some(bg) = &style.background {
+                classes.push(format!("bg-[{bg}]"));
+            }
+            if let Some(gradient) = &style.gradient {
+                let stops = gradient
+                    .stops
+                    .iter()
+                    .map(|s| format!("{} {}%", s.color, s.position * 100.0))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                classes.push(format!("bg-[linear-gradient({stops})]"));
+            }
+            if let Some(radius) = style.border_radius {
+                let full = node.width.min(node.height) as f64 / 2.0;
+                if radius >= full {
+                    classes.push("rounded-full".to_string());
+                } else {
+                    classes.push(format!("rounded-[{radius}px]"));
+                }
+            }
+            if let Some(opacity) = style.opacity {
+                classes.push(format!("opacity-[{opacity}]"));
+            }
+            if style.stroke_color.is_some() || style.stroke_width.is_some() {
+                let width = style.stroke_width.unwrap_or(1.0);
+                let color = style.stroke_color.clone().unwrap_or_else(|| "#fff".into());
+                classes.push(format!("border-[{width}px]"));
+                classes.push(format!("border-[{color}]"));
+            }
+            if let Some(color) = &style.color {
+                if color.eq_ignore_ascii_case("#ffffff") {
+                    classes.push("text-white".to_string());
+                } else {
+                    classes.push(format!("text-[{color}]"));
+                }
+            }
+            if let Some(size) = style.font_size {
+                classes.push(format!("text-[{size}px]"));
+            }
+            if let Some(weight) = style.font_weight {
+                let weight = weight.round() as i64;
+                let name = match weight {
+                    100 => "thin",
+                    200 => "extralight",
+                    300 => "light",
+                    400 => "normal",
+                    500 => "medium",
+                    600 => "semibold",
+                    700 => "bold",
+                    800 => "extrabold",
+                    900 => "black",
+                    _ => "",
+                };
+                classes.push(if name.is_empty() {
+                    format!("font-[{weight}]")
+                } else {
+                    format!("font-{name}")
+                });
+            }
+        }
+        classes.join(" ")
+    }
+
+    nodes
+        .iter()
+        .map(|node| {
+            let selector = class_name(node);
+            let code = match format {
+                StyleCodeFormat::Css => css_rule(node, &selector),
+                StyleCodeFormat::Tailwind => tw_rule(node),
+            };
+            StyleCodeItem {
+                id: node.id.clone(),
+                name: node.name.clone(),
+                selector,
+                code,
+            }
+        })
+        .collect()
 }
 
 /* -------------------------------- misc helpers ----------------------------- */
@@ -1750,13 +2167,13 @@ mod tests {
         let tree = extract_tree(&genome, None, &options);
         fn contains_name(nodes: &[TreeNode], name: &str) -> bool {
             nodes.iter().any(|n| {
-                n.name == name
-                    || n.children
-                        .as_ref()
-                        .is_some_and(|c| contains_name(c, name))
+                n.name == name || n.children.as_ref().is_some_and(|c| contains_name(c, name))
             })
         }
-        assert!(!contains_name(&tree, "Icon"), "region must exclude the icon");
+        assert!(
+            !contains_name(&tree, "Icon"),
+            "region must exclude the icon"
+        );
     }
 
     #[test]
@@ -1837,8 +2254,16 @@ mod tests {
         };
         let tree = extract_tree(&genome, None, &options);
         let mask = &tree[0].children.as_ref().unwrap()[0];
-        assert_eq!(mask.name, "蒙版组 94", "mask group must survive skipEmptyGroups");
+        assert_eq!(
+            mask.name, "蒙版组 94",
+            "mask group must survive skipEmptyGroups"
+        );
         assert_eq!(mask.children.as_ref().unwrap().len(), 2);
+        assert_eq!(
+            mask.is_mask_group,
+            Some(true),
+            "mask group must carry isMaskGroup marker"
+        );
 
         // Without mask markers the same empty group is lifted away.
         let mut stripped = genome;
@@ -1852,7 +2277,10 @@ mod tests {
         let style = NodeStyle::default();
         let value = serde_json::to_value(&style).unwrap();
         let map = value.as_object().unwrap();
-        assert!(map.is_empty(), "all-null style must serialize to an empty object");
+        assert!(
+            map.is_empty(),
+            "all-null style must serialize to an empty object"
+        );
         let style = NodeStyle {
             background: Some("#fff".into()),
             ..Default::default()
@@ -1927,7 +2355,10 @@ mod tests {
         let kids = tree[0].children.as_ref().unwrap();
         assert_eq!(kids[0].duplicate_of, None);
         assert_eq!(kids[1].duplicate_of.as_deref(), Some("a:1"));
-        assert_eq!(kids[2].duplicate_of, None, "different size is not a duplicate");
+        assert_eq!(
+            kids[2].duplicate_of, None,
+            "different size is not a duplicate"
+        );
     }
 
     #[test]
@@ -1950,6 +2381,164 @@ mod tests {
 
         let hits = find_nodes(&genome, None, "", 10);
         assert!(hits.is_empty(), "empty query returns nothing");
+    }
+
+    #[test]
+    fn find_nodes_reports_component_container() {
+        let genome = Genome {
+            pages: vec![GenomeNode {
+                id: Some("p:0".into()),
+                name: Some("Page".into()),
+                r#type: Some("page".into()),
+                rect: Some(Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 100.0,
+                    h: 100.0,
+                }),
+                children: vec![GenomeNode {
+                    id: Some("modal:1".into()),
+                    name: Some("弹窗容器".into()),
+                    r#type: Some("artboard".into()),
+                    rect: Some(Rect {
+                        x: 10.0,
+                        y: 10.0,
+                        w: 80.0,
+                        h: 80.0,
+                    }),
+                    children: vec![GenomeNode {
+                        id: Some("t:1".into()),
+                        name: Some("标题".into()),
+                        r#type: Some("text".into()),
+                        textbox: Some(Textbox {
+                            text: Some("编辑个人资料".into()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            styles: None,
+            images: Default::default(),
+        };
+        let hits = find_nodes(&genome, None, "编辑个人资料", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "t:1");
+        assert_eq!(hits[0].container_id.as_deref(), Some("modal:1"));
+        assert_eq!(hits[0].container_name.as_deref(), Some("弹窗容器"));
+        assert_eq!(hits[0].container_type.as_deref(), Some("artboard"));
+    }
+
+    #[test]
+    fn style_code_css_generation() {
+        let node = |id: &str, name: &str, x: i64, y: i64| TreeNode {
+            id: id.into(),
+            name: name.into(),
+            r#type: "layer".into(),
+            x,
+            y,
+            width: 80,
+            height: 80,
+            style: Some(NodeStyle {
+                background: Some("#76b7a1".into()),
+                border_radius: Some(45.0),
+                stroke_color: Some("rgba(255,255,255,0.10)".into()),
+                stroke_width: Some(1.0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let items = generate_style_code(&[node("n1", "头像", 400, 163)], StyleCodeFormat::Css);
+        assert_eq!(items.len(), 1);
+        let code = &items[0].code;
+        assert!(code.contains("position: absolute;"));
+        assert!(code.contains("left: 400px;"));
+        assert!(code.contains("top: 163px;"));
+        assert!(code.contains("width: 80px;"));
+        assert!(code.contains("background: #76b7a1;"));
+        // 80x80 with radius 45 == full circle -> 50%.
+        assert!(code.contains("border-radius: 50%;"));
+        assert!(code.contains("border: 1px solid rgba(255,255,255,0.10);"));
+        assert!(items[0].selector.starts_with("头像-"));
+    }
+
+    #[test]
+    fn style_code_tailwind_generation() {
+        let text_node = TreeNode {
+            id: "n2".into(),
+            name: "昵称".into(),
+            r#type: "text".into(),
+            x: 420,
+            y: 367,
+            width: 141,
+            height: 30,
+            style: Some(NodeStyle {
+                color: Some("#ffffff".into()),
+                font_size: Some(20.0),
+                font_weight: Some(500.0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let items = generate_style_code(&[text_node], StyleCodeFormat::Tailwind);
+        let code = &items[0].code;
+        assert!(code.contains("absolute"));
+        assert!(code.contains("left-[420px]"));
+        assert!(code.contains("top-[367px]"));
+        assert!(code.contains("w-[141px]"));
+        assert!(code.contains("h-[30px]"));
+        assert!(code.contains("text-white"));
+        assert!(code.contains("text-[20px]"));
+        assert!(code.contains("font-medium"));
+    }
+
+    #[test]
+    fn style_code_full_radius_rounds_to_full() {
+        let node = TreeNode {
+            id: "n3".into(),
+            name: "按钮".into(),
+            r#type: "layer".into(),
+            width: 60,
+            height: 60,
+            style: Some(NodeStyle {
+                background: Some("#0a9657".into()),
+                border_radius: Some(8.0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let css = generate_style_code(std::slice::from_ref(&node), StyleCodeFormat::Css);
+        assert!(
+            css[0].code.contains("border-radius: 8px;"),
+            "small radius stays px"
+        );
+        let mut full = node;
+        full.style.as_mut().unwrap().border_radius = Some(40.0);
+        let css = generate_style_code(&[full], StyleCodeFormat::Css);
+        assert!(
+            css[0].code.contains("border-radius: 50%;"),
+            "half-size radius is a full circle"
+        );
+    }
+
+    #[test]
+    fn style_code_format_parse() {
+        assert_eq!(
+            StyleCodeFormat::parse(Some("css")),
+            Some(StyleCodeFormat::Css)
+        );
+        assert_eq!(
+            StyleCodeFormat::parse(Some("tailwind")),
+            Some(StyleCodeFormat::Tailwind)
+        );
+        assert_eq!(
+            StyleCodeFormat::parse(Some("tw")),
+            Some(StyleCodeFormat::Tailwind)
+        );
+        assert_eq!(StyleCodeFormat::parse(None), Some(StyleCodeFormat::Css));
+        assert_eq!(StyleCodeFormat::parse(Some("nope")), None);
     }
 
     #[test]
@@ -2202,6 +2791,167 @@ mod tests {
     }
 
     #[test]
+    fn diff_name_fallback_pairs_nearest_geometry_not_arbitrary() {
+        // Three same-name nodes ("Icon") at different positions; B has the
+        // same set with new uuids. Nearest-geometry pairing must pair each B
+        // node with the A node at the same spot — no fake rect changes.
+        let icon = |id: &str, x: i64, y: i64| TreeNode {
+            id: id.into(),
+            name: "Icon".into(),
+            r#type: "layer".into(),
+            x,
+            y,
+            width: 24,
+            height: 24,
+            ..Default::default()
+        };
+        let a = vec![icon("a1", 0, 0), icon("a2", 100, 0), icon("a3", 0, 100)];
+        let b = vec![icon("b1", 0, 0), icon("b2", 100, 0), icon("b3", 0, 100)];
+        let diff = diff_trees(&a, &b);
+        assert_eq!(
+            diff.added.len(),
+            0,
+            "all same-name nodes must pair by position"
+        );
+        assert_eq!(diff.removed.len(), 0);
+        assert!(
+            diff.changed.is_empty(),
+            "identical positions must not report rect changes"
+        );
+
+        // Now B's third icon actually moved to (5, 5): only that pair changes.
+        let b_moved = vec![icon("b1", 0, 0), icon("b2", 100, 0), icon("b3", 5, 5)];
+        let diff = diff_trees(&a, &b_moved);
+        assert_eq!(diff.changed.len(), 1);
+        assert_eq!(diff.changed[0].id, "b3");
+        assert_eq!(diff.changed[0].fields, vec!["rect"]);
+    }
+
+    #[test]
+    fn diff_same_name_different_type_not_paired() {
+        let a = vec![TreeNode {
+            id: "a1".into(),
+            name: "Badge".into(),
+            r#type: "layer".into(),
+            ..Default::default()
+        }];
+        let b = vec![TreeNode {
+            id: "b1".into(),
+            name: "Badge".into(),
+            r#type: "text".into(),
+            ..Default::default()
+        }];
+        let diff = diff_trees(&a, &b);
+        assert_eq!(diff.added.len(), 1, "type mismatch must not pair by name");
+        assert_eq!(diff.added[0].id, "b1");
+        assert_eq!(diff.removed.len(), 1);
+        assert_eq!(diff.removed[0].id, "a1");
+        assert!(diff.changed.is_empty());
+    }
+
+    #[test]
+    fn diff_single_page_root_wrapper_not_reported() {
+        // Two single-page designs, same viewport, different page uuid/name:
+        // the page container itself must not land in added/removed.
+        let page = |id: &str, name: &str, child_id: &str| TreeNode {
+            id: id.into(),
+            name: name.into(),
+            r#type: "artboard".into(),
+            width: 1440,
+            height: 900,
+            children: Some(vec![TreeNode {
+                id: child_id.into(),
+                name: "内容".into(),
+                r#type: "layer".into(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let a = vec![page("page-a", "首页 - 个人资料", "child-a")];
+        let b = vec![page("page-b", "首页 - 个人资料（hover）", "child-b")];
+        let diff = diff_trees(&a, &b);
+        assert!(
+            diff.added
+                .iter()
+                .all(|n| n.name != "首页 - 个人资料（hover）"),
+            "page wrapper must not be reported as added"
+        );
+        assert!(
+            diff.removed.iter().all(|n| n.name != "首页 - 个人资料"),
+            "page wrapper must not be reported as removed"
+        );
+        // The inner "内容" child has the same name on both sides, so it pairs
+        // via the same-name fallback: no structural adds/removes, no changes.
+        assert!(
+            diff.added.is_empty(),
+            "same-name child must pair, got {:?}",
+            diff.added
+        );
+        assert!(diff.removed.is_empty());
+        assert!(diff.changed.is_empty());
+    }
+
+    #[test]
+    fn mask_group_survives_with_pure_mask_marker_only() {
+        // Real genome data sometimes only carries `isPureMask` on the clip
+        // shape; the mask group must still survive skipEmptyGroups.
+        let genome = Genome {
+            pages: vec![GenomeNode {
+                id: Some("p:0".into()),
+                name: Some("Page".into()),
+                r#type: Some("page".into()),
+                rect: Some(Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 100.0,
+                    h: 100.0,
+                }),
+                children: vec![GenomeNode {
+                    id: Some("mask:1".into()),
+                    name: Some("蒙版组 94".into()),
+                    r#type: Some("group".into()),
+                    rect: Some(Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 60.0,
+                        h: 60.0,
+                    }),
+                    children: vec![GenomeNode {
+                        id: Some("shape:1".into()),
+                        name: Some("裁剪形状".into()),
+                        r#type: Some("layer".into()),
+                        blend: Some(Blend {
+                            opacity: Some(1.0),
+                            is_mask: None,
+                            is_pure_mask: Some(true),
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            styles: None,
+            images: Default::default(),
+        };
+        let options = TreeOptions {
+            skip_empty_groups: true,
+            ..Default::default()
+        };
+        let tree = extract_tree(&genome, None, &options);
+        let mask = &tree[0].children.as_ref().unwrap()[0];
+        assert_eq!(
+            mask.name, "蒙版组 94",
+            "isPureMask-only group must survive skipEmptyGroups"
+        );
+        assert_eq!(
+            mask.is_mask_group,
+            Some(true),
+            "mask group must carry isMaskGroup marker"
+        );
+    }
+
+    #[test]
     fn tree_snapshot_hash_exposed() {
         let genome = Genome {
             pages: vec![GenomeNode {
@@ -2268,7 +3018,9 @@ mod tests {
         };
         let tree = extract_tree(&genome_preview, None, &TreeOptions::default());
         assert_eq!(
-            tree[0].children.as_ref().unwrap()[0].snapshot_hash.as_deref(),
+            tree[0].children.as_ref().unwrap()[0]
+                .snapshot_hash
+                .as_deref(),
             Some("snap-xyz")
         );
     }
@@ -2424,7 +3176,10 @@ mod tests {
         assert_eq!(genome.styles.as_ref().unwrap().fill_styles.len(), 1);
         let node = &genome.pages[0].children[0].children[0];
         assert_eq!(
-            node.textbox.as_ref().and_then(|t| t.text.clone()).as_deref(),
+            node.textbox
+                .as_ref()
+                .and_then(|t| t.text.clone())
+                .as_deref(),
             Some("最近游戏")
         );
         let seg = node.textbox.as_ref().unwrap().segments.first().unwrap();
@@ -2438,11 +3193,11 @@ mod tests {
             Some("Semibold")
         );
         assert_eq!(seg.line_height.as_ref().and_then(|l| l.value), Some(29.0));
+        assert_eq!(seg.letter_spacing.as_ref().and_then(|l| l.value), Some(0.0));
         assert_eq!(
-            seg.letter_spacing.as_ref().and_then(|l| l.value),
-            Some(0.0)
+            genome.images.get("abc123").and_then(|i| i.url.as_deref()),
+            Some("https://fs.moonvy.com/x.png")
         );
-        assert_eq!(genome.images.get("abc123").and_then(|i| i.url.as_deref()), Some("https://fs.moonvy.com/x.png"));
 
         // Style extraction on the parsed node: typography + stroke + radius.
         let style = extract_raw_node_style(&genome, node);
@@ -2492,7 +3247,9 @@ mod tests {
         let project = "https://moonvy.com/project/4cf87739-556a-48e7-84f4-bd76f660a48a/75168c2b-5761-4edd-8c94-cd4adaa7d8da";
 
         // 1. Project directory URL -> design list (previews, no junk fields).
-        let rows = list_pages(&api, project, 500, 20).await.expect("list_pages");
+        let rows = list_pages(&api, project, 500, 20)
+            .await
+            .expect("list_pages");
         assert!(!rows.is_empty(), "project must expose designs");
         assert!(
             rows.iter().all(|r| !r.url.is_empty() && !r.id.is_empty()),
@@ -2516,15 +3273,15 @@ mod tests {
 
         // 2. Directory URL auto-resolves to a design; metadata extraction.
         let (ids, genome) = genome_for_url(&api, project).await.expect("auto-resolve");
-        assert!(ids.file_id.is_some(), "directory URL must resolve to a design file");
+        assert!(
+            ids.file_id.is_some(),
+            "directory URL must resolve to a design file"
+        );
         let meta = extract_design_meta(&genome, None);
         assert!(meta.frame_count > 0, "design must expose frames");
         println!(
             "2) auto-resolved: title={} frames={} ({}x{})",
-            meta.title,
-            meta.frame_count,
-            meta.frames[0].width,
-            meta.frames[0].height
+            meta.title, meta.frame_count, meta.frames[0].width, meta.frames[0].height
         );
 
         // 3. Tree options on a concrete design (the 个人资料 page).
@@ -2546,7 +3303,10 @@ mod tests {
             100.0 * (full_count - reduced_count) as f64 / full_count.max(1) as f64,
             reduced_bytes.len()
         );
-        assert!(reduced_count <= full_count, "skipEmptyGroups must not grow the tree");
+        assert!(
+            reduced_count <= full_count,
+            "skipEmptyGroups must not grow the tree"
+        );
         assert!(
             reduced_bytes.len() <= 62 * 1024,
             "compact output must stay near the 60KB acceptance target (got {} bytes; the 314-node reference design projects to ~58KB)",
@@ -2620,9 +3380,7 @@ mod tests {
             .iter()
             .filter(|n| n.style.as_ref().is_some_and(|s| s.font_size.is_some()))
             .count();
-        println!(
-            "   text nodes={text_nodes} nodes with fontSize={with_font_size}"
-        );
+        println!("   text nodes={text_nodes} nodes with fontSize={with_font_size}");
 
         // 5b. moonvy_find_node: targeted search instead of a full tree dump.
         let hits = find_nodes(&genome_a, None, "头像", 10);
@@ -2657,7 +3415,10 @@ mod tests {
         println!(
             "5c) only:[\"image\"] -> {} top nodes / {image_total} total ({} with snapshot); raw image-fill nodes={raw_image_fills}",
             image_tree.len(),
-            image_tree.iter().filter(|n| n.snapshot_hash.is_some()).count()
+            image_tree
+                .iter()
+                .filter(|n| n.snapshot_hash.is_some())
+                .count()
         );
         assert!(
             image_total >= raw_image_fills && image_total <= raw_image_fills + 2,
@@ -2675,7 +3436,10 @@ mod tests {
         let resolved = resolve_asset(&api, &profile.url, &profile.id, None, None)
             .await
             .expect("resolve asset url");
-        assert!(resolved.url.starts_with("http"), "resolved URL must be absolute");
+        assert!(
+            resolved.url.starts_with("http"),
+            "resolved URL must be absolute"
+        );
         println!(
             "5d) asset url: \"{}\" ({} bytes unknown; ext={})",
             resolved.url, resolved.name, resolved.extension
@@ -2699,7 +3463,10 @@ mod tests {
         );
         let paired =
             diff.added.len() < b_flat || diff.removed.len() < a_flat || !diff.changed.is_empty();
-        assert!(paired, "diff must pair some nodes (id or same-name fallback)");
+        assert!(
+            paired,
+            "diff must pair some nodes (id or same-name fallback)"
+        );
         // Changed rects must be absolute (flatten) — comparable with the tree.
         let changed_rect_ok = diff.changed.iter().all(|c| {
             c.before
@@ -2708,7 +3475,10 @@ mod tests {
                 .map(|(b, a)| b.x == a.x && b.y == a.y || c.fields.contains(&"rect".to_string()))
                 .unwrap_or(true)
         });
-        assert!(changed_rect_ok, "changed nodes carry comparable coordinates");
+        assert!(
+            changed_rect_ok,
+            "changed nodes carry comparable coordinates"
+        );
         if !diff.changed.is_empty() {
             let first = &diff.changed[0];
             println!(
@@ -2731,9 +3501,149 @@ mod tests {
         )
         .await
         .expect("download design snapshot");
-        println!("7) download: \"{name}\" -> {} ({} bytes)", path.display(), size);
+        println!(
+            "7) download: \"{name}\" -> {} ({} bytes)",
+            path.display(),
+            size
+        );
         assert!(size > 0, "downloaded file must not be empty");
         assert!(path.exists(), "downloaded file must exist");
         let _ = std::fs::remove_dir_all(&out_dir);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network"]
+    async fn repro_issues() {
+        use crate::api::MoonvyApi;
+        use crate::token;
+        use crate::tools::{genome_for_url, list_pages};
+
+        let token = token::load_token().expect("token");
+        let api = MoonvyApi::new(token).expect("api");
+        let project = "https://moonvy.com/project/4cf87739-556a-48e7-84f4-bd76f660a48a/75168c2b-5761-4edd-8c94-cd4adaa7d8da";
+        let rows = list_pages(&api, project, 500, 20).await.expect("rows");
+        for r in &rows {
+            println!(
+                "ROW type={} id={} name={} preview={:?}",
+                r.r#type, r.id, r.name, r.preview
+            );
+        }
+        let hover = rows
+            .iter()
+            .find(|r| r.name.contains("头像移入"))
+            .expect("hover");
+        let profile = rows
+            .iter()
+            .find(|r| r.name.contains("个人资料") && !r.name.contains("头像移入"))
+            .expect("profile");
+        println!("HOVER = {}", hover.url);
+        println!("PROFILE = {}", profile.url);
+
+        let (_, genome_b) = genome_for_url(&api, &hover.url).await.expect("genome B");
+        let opts = TreeOptions {
+            with_style: true,
+            skip_empty_groups: true,
+            flatten: true,
+            detect_duplicates: true,
+            ..Default::default()
+        };
+        let tree = extract_tree(&genome_b, None, &opts);
+        let mut log = String::new();
+        use std::collections::HashMap;
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for n in flatten_tree(&tree) {
+            *counts.entry(n.name.clone()).or_default() += 1;
+        }
+        for (name, c) in counts.iter().filter(|(_, c)| **c > 1) {
+            log.push_str(&format!("DUP-NAME [{name}] x{c}\n"));
+            for n in flatten_tree(&tree).iter().filter(|n| n.name == *name) {
+                log.push_str(&format!(
+                    "   id={} dupOf={:?} x={} y={} w={} h={} type={} style={:?}\n",
+                    n.id,
+                    n.duplicate_of,
+                    n.x,
+                    n.y,
+                    n.width,
+                    n.height,
+                    n.r#type,
+                    n.style.as_ref().map(|s| format!(
+                        "bg={:?} r={:?} op={:?} grad={:?}",
+                        s.background,
+                        s.border_radius,
+                        s.opacity,
+                        s.gradient
+                            .as_ref()
+                            .map(|g| (g.r#type.clone(), g.stops.len()))
+                    ))
+                ));
+            }
+        }
+        let dup_total = flatten_tree(&tree)
+            .iter()
+            .filter(|n| n.duplicate_of.is_some())
+            .count();
+        log.push_str(&format!("TOTAL duplicateOf = {dup_total}\n"));
+
+        let mut stack: Vec<&crate::genome::GenomeNode> = genome_b.pages.iter().collect();
+        while let Some(n) = stack.pop() {
+            if let Some(b) = &n.blend
+                && (b.is_mask == Some(true) || b.is_pure_mask == Some(true))
+            {
+                log.push_str(&format!(
+                    "MASK-RAW id={:?} name={:?} type={:?} rect={:?}\n",
+                    n.id, n.name, n.r#type, n.rect
+                ));
+            }
+            stack.extend(n.children.iter());
+        }
+
+        let (_, genome_a) = genome_for_url(&api, &profile.url).await.expect("genome A");
+        let tree_a = extract_tree(&genome_a, None, &opts);
+        let tree_b = extract_tree(&genome_b, None, &opts);
+        let diff = diff_trees(&tree_a, &tree_b);
+        log.push_str(&format!(
+            "DIFF added={} removed={} changed={}\n",
+            diff.added.len(),
+            diff.removed.len(),
+            diff.changed.len()
+        ));
+        let rect_only = diff
+            .changed
+            .iter()
+            .filter(|c| c.fields == vec!["rect"])
+            .count();
+        log.push_str(&format!("DIFF changed rect-only = {rect_only}\n"));
+        for c in &diff.changed {
+            log.push_str(&format!(
+                "CHG id={} name=[{}] fields={:?} a=[x{} y{} w{} h{}] b=[x{} y{} w{} h{}]\n",
+                c.id,
+                c.name,
+                c.fields,
+                c.before.as_ref().map(|n| n.x).unwrap_or_default(),
+                c.before.as_ref().map(|n| n.y).unwrap_or_default(),
+                c.before.as_ref().map(|n| n.width).unwrap_or_default(),
+                c.before.as_ref().map(|n| n.height).unwrap_or_default(),
+                c.after.as_ref().map(|n| n.x).unwrap_or_default(),
+                c.after.as_ref().map(|n| n.y).unwrap_or_default(),
+                c.after.as_ref().map(|n| n.width).unwrap_or_default(),
+                c.after.as_ref().map(|n| n.height).unwrap_or_default(),
+            ));
+        }
+        for a in &diff.added {
+            log.push_str(&format!(
+                "ADD type={} name=[{}] x={} y={} w={} h={}\n",
+                a.r#type, a.name, a.x, a.y, a.width, a.height
+            ));
+        }
+        for r in &diff.removed {
+            log.push_str(&format!(
+                "REM type={} name=[{}] x={} y={} w={} h={}\n",
+                r.r#type, r.name, r.x, r.y, r.width, r.height
+            ));
+        }
+        let out = std::path::Path::new("C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\opencode")
+            .join("repro.txt");
+        std::fs::write(&out, &log).expect("write log");
+        print!("{log}");
     }
 }

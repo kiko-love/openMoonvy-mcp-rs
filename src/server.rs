@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Moonvy MCP server: full tool set. Business logic lives in tools.rs;
  * this module only declares tool schemas and routes calls.
  */
@@ -346,6 +346,21 @@ pub struct DiffDesignsRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StyleCodeRequest {
+    /// Moonvy design URL
+    pub url: String,
+    /// Export only the subtree rooted at this node id (find it via moonvy_find_node)
+    pub node_id: Option<String>,
+    /// Optional frame/page ID filter
+    pub frame: Option<String>,
+    /// Output format: "css" or "tailwind" (default: css)
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct SetTokenRequest {
     /// Moonvy JWT token from a logged-in browser session
     pub token: String,
@@ -393,6 +408,7 @@ impl MoonvyServer {
         let (_, genome) = tools::genome_for_url(&self.api, &req.url)
             .await
             .map_err(tools::tool_error)?;
+        let node_id = req.node_id.clone();
         let options = TreeOptions {
             with_style: req.with_style,
             max_depth: req.max_depth,
@@ -411,12 +427,22 @@ impl MoonvyServer {
                 a
             }),
         };
-        tools::json_string(tools::tree_payload(
-            &genome,
-            req.frame.as_deref(),
-            &options,
-            req.include_assets,
-        ))
+        let mut payload =
+            tools::tree_payload(&genome, req.frame.as_deref(), &options, req.include_assets);
+        if let Some(node_id) = &node_id {
+            // A nodeId that does not exist in this design should be reported
+            // instead of silently returning an empty tree.
+            let empty = payload
+                .get("items")
+                .and_then(|v| v.as_array())
+                .is_none_or(|a| a.is_empty());
+            if empty {
+                let obj = payload.as_object_mut().expect("payload is an object");
+                obj.insert("status".into(), json!("not_found"));
+                obj.insert("nodeId".into(), json!(node_id));
+            }
+        }
+        tools::json_string(payload)
     }
 
     #[tool(
@@ -668,7 +694,18 @@ impl MoonvyServer {
         let workspace = resolve_workspace_dir(&req.workspace_dir).map_err(tools::tool_error)?;
         let matches =
             tools::search_designs(&workspace, &req.name, 20).map_err(tools::tool_error)?;
-        if matches.len() != 1 {
+        // Exact matches (score 100) take priority: a query that hits one
+        // design exactly must not be reported as ambiguous just because other
+        // designs contain the name as a substring.
+        let exact: Vec<&Value> = matches
+            .iter()
+            .filter(|m| m.get("score").and_then(|s| s.as_u64()) == Some(100))
+            .collect();
+        let selected = if exact.len() == 1 {
+            exact[0]
+        } else if exact.is_empty() && matches.len() == 1 {
+            &matches[0]
+        } else {
             let status = if matches.is_empty() {
                 "not_found"
             } else {
@@ -681,14 +718,14 @@ impl MoonvyServer {
                 "query": req.name,
                 "matches": matches,
             }));
-        }
-        let design_url = matches[0]
+        };
+        let design_url = selected
             .get("url")
             .and_then(|u| u.as_str())
             .unwrap_or_default()
             .to_string();
         let design: crate::catalog::CatalogDesign =
-            serde_json::from_value(matches[0].clone()).map_err(tools::tool_error)?;
+            serde_json::from_value(selected.clone()).map_err(tools::tool_error)?;
         let (_, genome) = tools::genome_for_url(&self.api, &design_url)
             .await
             .map_err(tools::tool_error)?;
@@ -710,6 +747,48 @@ impl MoonvyServer {
             "workspaceDir": workspace.to_string_lossy(),
             "design": design,
             "tree": { "items": tree },
+        }))
+    }
+
+    #[tool(
+        name = "moonvy_get_style_code",
+        description = "Generate CSS or Tailwind snippets for a design (or a single node subtree). Returns { items: [ {id,name,selector,code} ] } - one entry per node, with absolute positioning (flatten), background/gradient/border-radius/stroke/text styles resolved. Use nodeId (from moonvy_find_node) to scope output to one component; format: \"css\" (default) or \"tailwind\"."
+    )]
+    async fn get_style_code(
+        &self,
+        Parameters(req): Parameters<StyleCodeRequest>,
+    ) -> Result<String, McpError> {
+        let format =
+            crate::genome::StyleCodeFormat::parse(req.format.as_deref()).ok_or_else(|| {
+                McpError::invalid_params("format must be \"css\" or \"tailwind\"".to_string(), None)
+            })?;
+        let (_, genome) = tools::genome_for_url(&self.api, &req.url)
+            .await
+            .map_err(tools::tool_error)?;
+        let node_id = req.node_id.clone();
+        let options = TreeOptions {
+            with_style: true,
+            flatten: true,
+            skip_empty_groups: true,
+            detect_duplicates: true,
+            text_content: crate::genome::TextContent::Truncate,
+            node_id: req.node_id,
+            ..Default::default()
+        };
+        let tree = crate::genome::extract_tree(&genome, req.frame.as_deref(), &options);
+        if node_id.is_some() && tree.is_empty() {
+            return tools::json_string(json!({
+                "status": "not_found",
+                "items": [],
+                "nodeId": node_id,
+                "format": format!("{:?}", format).to_lowercase(),
+            }));
+        }
+        let items = crate::genome::generate_style_code(&tree, format);
+        tools::json_string(json!({
+            "items": items,
+            "format": format!("{:?}", format).to_lowercase(),
+            "count": items.len(),
         }))
     }
 
@@ -746,7 +825,7 @@ impl MoonvyServer {
 
     #[tool(
         name = "moonvy_diff_designs",
-        description = "Compare two design URLs by node id (with same-name fallback). Returns { summary: {added,removed,changed,aNodes,bNodes}, added, removed, changed:[{id,name,fields}] } with before/after snapshots when withSnapshots. Coordinates are absolute by default (flatten). Supports skipEmptyGroups, only."
+        description = "Compare two design URLs by node id (with same-name fallback). Same-name nodes are paired by minimum-total geometry distance (Hungarian assignment) and must match node type, so unrelated same-name layers are NOT cross-matched; single-page root containers with identical viewport size are excluded from added/removed (only their children are diffed). Returns { summary: {added,removed,changed,aNodes,bNodes}, added, removed, changed:[{id,name,fields}] } with before/after snapshots when withSnapshots. Coordinates are absolute by default (flatten). Supports skipEmptyGroups, only."
     )]
     async fn diff_designs(
         &self,
@@ -859,7 +938,7 @@ impl ServerHandler for MoonvyServer {
                  moonvy_list_pages, moonvy_list_layers, moonvy_find_node, moonvy_get_node_style, \
                  moonvy_extract_tokens, moonvy_get_asset_url, moonvy_download_asset, \
                  moonvy_sync_project, moonvy_search_designs, moonvy_get_tree_by_name, \
-                 moonvy_diff_designs, moonvy_set_token.",
+                 moonvy_diff_designs, moonvy_get_style_code, moonvy_set_token.",
         )
     }
 
@@ -997,7 +1076,8 @@ fn get_prompt_impl(
             ))
         }
         "moonvy_handoff" => {
-            let workspace_dir = arg(request, "workspaceDir").unwrap_or_default();            let workspace = resolve_workspace_dir(&workspace_dir).map_err(tools::tool_error)?;
+            let workspace_dir = arg(request, "workspaceDir").unwrap_or_default();
+            let workspace = resolve_workspace_dir(&workspace_dir).map_err(tools::tool_error)?;
             let catalog = Catalog::load(&workspace).map_err(tools::tool_error)?;
             let aliases: std::collections::HashMap<String, Value> =
                 std::fs::read_to_string(artifact_path(&workspace, "aliases"))

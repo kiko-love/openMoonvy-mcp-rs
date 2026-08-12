@@ -7,10 +7,11 @@
 - 🚀 单二进制：编译后一个可执行文件，无运行时依赖
 - ⚡ 纯 API：Bearer token 直连 Moonvy（`global-api.moonvy.com`），无浏览器、无 daemon
 - 🌳 输出降噪：`skipEmptyGroups`（丢弃空容器）、`flatten`（画板原点绝对坐标）、`only`（类型/`image` 语义过滤）、`detectDuplicates`（重复标注）
-- 🎯 定向检索：`moonvy_find_node` 按名称/文本搜索节点，无需全树转储
-- 🔍 状态对比：`moonvy_diff_designs` 输出 added/removed/changed + before/after 快照，支持跨页面同名配对
-- 📐 强类型：serde 解析 genome（camelCase + borderRadius 数组兼容），字段错误编译期发现
-- 🗂️ 工作区索引：`.moonvy-mcp/catalog.json` 支持按名称/别名/标签检索设计
+- 🎯 定向检索：`moonvy_find_node` 按名称/文本搜索节点（id/bbox/text/**容器上下文**），无需全树转储
+- 🔍 状态对比：`moonvy_diff_designs` 输出 added/removed/changed + before/after 快照；同名节点按最小总几何距离（匈牙利匹配）+ 类型约束配对，避免交叉误报；单页画板容器不进 diff
+- 🧬 蒙版语义：`isMaskGroup` 标注裁剪容器（兼容 `isPureMask`），`skipEmptyGroups` 不再误删蒙版组
+- 💻 样式代码：`moonvy_get_style_code` 一键生成 CSS / Tailwind（绝对定位 + 圆角判圆 + 渐变/描边/字重），支持 `nodeId` 限定组件
+- 🗂️ 工作区索引：`.moonvy-mcp/catalog.json` 支持按名称/别名/标签检索设计（含尺寸元数据）
 
 ## 安装
 
@@ -31,19 +32,20 @@ irm https://github.com/kiko-love/openMoonvy-mcp-rs/releases/latest/download/open
 cargo install openmoonvy-mcp-rs
 ```
 
-## 工具（14 个）
+## 工具（15 个）
 
 | 工具 | 说明 |
 |---|---|
 | `moonvy_get_design` | 设计元数据（标题、画框尺寸） |
 | `moonvy_get_design_context` | 一次返回 元数据+图层树+Token（聚合入口） |
-| `moonvy_get_tree` | 图层树：`withStyle` / `skipEmptyGroups` / `flatten` / `only` / `detectDuplicates` / `includeAssets` |
-| `moonvy_get_tree_by_name` | 按名称取图层树（基于 catalog 索引） |
-| `moonvy_find_node` | 按名称/文本子串搜索节点（id/bbox/text） |
-| `moonvy_list_pages` | 项目文件列表（分页 BFS，含 preview 缩略图） |
+| `moonvy_get_tree` | 图层树：`withStyle` / `skipEmptyGroups` / `flatten` / `only` / `detectDuplicates` / `includeAssets` / `nodeId` 子树 / `region` 区域 |
+| `moonvy_get_tree_by_name` | 按名称取图层树（基于 catalog 索引，唯一精确匹配直接返回） |
+| `moonvy_find_node` | 按名称/文本子串搜索节点（id/bbox/text/containerId） |
+| `moonvy_list_pages` | 项目文件列表（分页 BFS，含 preview/尺寸/时间元数据） |
 | `moonvy_list_layers` | 扁平图层列表（找节点 ID） |
 | `moonvy_get_node_style` | 单节点样式（strokeWidth/strokeColor/gradient/字重映射） |
 | `moonvy_extract_tokens` | 设计 Token（colors/fontSizes/radii/spacing） |
+| `moonvy_get_style_code` | 生成 CSS / Tailwind 样式代码（支持 nodeId 限定组件） |
 | `moonvy_get_asset_url` | 资产直链（slice/snapshot/image，不落盘） |
 | `moonvy_download_asset` | 下载切图/快照/图片填充到本地 |
 | `moonvy_diff_designs` | 对比两个设计（added/removed/changed + before/after） |
@@ -58,6 +60,7 @@ cargo install openmoonvy-mcp-rs
 3. **获取设计**：调用 `moonvy_get_design_context`（URL 传 `https://moonvy.com/project/...` 目录或具体设计文件 URL），一次拿到元数据 + 图层树 + Token。
 4. **降噪还原**：`moonvy_get_tree` 带 `skipEmptyGroups` + `flatten` + `detectDuplicates`；找特定元素用 `moonvy_find_node`；取图用 `moonvy_get_asset_url` / `moonvy_download_asset`。
 5. **对比状态**：`moonvy_diff_designs` 对比普通态与 hover 态两个设计，直接输出变更图层。
+6. **生成样式代码**：`moonvy_get_style_code`（`format: "css" | "tailwind"`，可用 `nodeId` 限定单个组件）直接产出可粘贴的样式片段。
 
 ## 配置 MCP（opencode / Claude Code / Cursor）
 
@@ -82,7 +85,7 @@ cargo install openmoonvy-mcp-rs
 
 ```bash
 cargo build --release          # 产物：target/release/openmoonvy-mcp-rs(.exe)
-cargo test                     # 27 个单元测试（serde 解析/树选项/diff/token）
+cargo test                     # 46 个单元测试（serde 解析/树选项/diff/token/样式代码）
 cargo test -- --ignored --nocapture real_api_smoke   # 真实 Moonvy API 端到端实测
 ```
 

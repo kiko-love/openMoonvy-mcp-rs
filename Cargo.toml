@@ -3,7 +3,7 @@ repository = "https://github.com/kiko-love/openMoonvy-mcp-rs"
 license = "MIT"
 description = "Moonvy design extraction MCP server (Rust, pure API)"
 name = "openmoonvy-mcp-rs"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 
 [dependencies]

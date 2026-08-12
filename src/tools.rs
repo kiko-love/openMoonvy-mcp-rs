@@ -151,6 +151,7 @@ fn infer_extension(url: &str) -> String {
 /* ------------------------------- page listing ------------------------------ */
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PageRow {
     pub id: String,
     pub name: String,
@@ -160,9 +161,20 @@ pub struct PageRow {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview: Option<PagePreview>,
+    /// Best-effort timestamps from the list API (may be absent).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    /// Best-effort frame dimensions from the list API (may be absent).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PagePreview {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub normal: Option<String>,
@@ -265,6 +277,51 @@ fn normalize_item(item: &Value, project_id: &str, input_dir_id: Option<&str>) ->
     let obj = item.as_object()?;
     let id = pick_string(obj, &["id", "nodeId", "fileId", "_id", "uuid"])?;
     let parent_id = pick_string(obj, &["parentId", "pid", "dirId", "folderId", "parent_id"]);
+    let created_at = pick_string(
+        obj,
+        &[
+            "createdAt",
+            "createTime",
+            "ctime",
+            "createdAtTime",
+            "created",
+        ],
+    );
+    let updated_at = pick_string(
+        obj,
+        &[
+            "updatedAt",
+            "updateTime",
+            "mtime",
+            "updatedAtTime",
+            "updated",
+        ],
+    );
+    let mut width = obj
+        .get("width")
+        .and_then(|v| v.as_i64())
+        .or_else(|| obj.get("w").and_then(|v| v.as_i64()));
+    let mut height = obj
+        .get("height")
+        .and_then(|v| v.as_i64())
+        .or_else(|| obj.get("h").and_then(|v| v.as_i64()));
+    // Some list APIs pack dimensions into a nested size/rect object.
+    for key in ["size", "rect", "dimensions", "frame"] {
+        if let Some(map) = obj.get(key).and_then(|v| v.as_object()) {
+            if width.is_none() {
+                width = map
+                    .get("width")
+                    .and_then(|v| v.as_i64())
+                    .or_else(|| map.get("w").and_then(|v| v.as_i64()));
+            }
+            if height.is_none() {
+                height = map
+                    .get("height")
+                    .and_then(|v| v.as_i64())
+                    .or_else(|| map.get("h").and_then(|v| v.as_i64()));
+            }
+        }
+    }
     let row = PageRow {
         id: id.clone(),
         name: pick_string(obj, &["name", "title", "displayName"]).unwrap_or_default(),
@@ -273,6 +330,10 @@ fn normalize_item(item: &Value, project_id: &str, input_dir_id: Option<&str>) ->
         project_id: project_id.to_string(),
         url: crate::api::file_url_for(project_id, parent_id.as_deref().or(input_dir_id), &id),
         preview: None,
+        created_at,
+        updated_at,
+        width,
+        height,
     };
     if let Some(preview) = obj.get("preview").and_then(|p| p.as_object()) {
         let normal = pick_string(preview, &["normal"]);
@@ -683,6 +744,8 @@ pub fn normalize_catalog_designs(
                 aliases: prev.map(|p| p.aliases.clone()).unwrap_or_default(),
                 tags: prev.map(|p| p.tags.clone()).unwrap_or_default(),
                 last_synced_at: now.to_string(),
+                width: row.width,
+                height: row.height,
             }
         })
         .filter(|d| !d.url.is_empty() && !d.name.is_empty())
@@ -750,7 +813,9 @@ pub fn tree_payload(
         let mut stack: Vec<&crate::genome::TreeNode> = tree.iter().collect();
         while let Some(node) = stack.pop() {
             if let Some(hash) = node.snapshot_hash.as_deref() {
-                refs.entry(hash.to_string()).or_default().push(node.id.clone());
+                refs.entry(hash.to_string())
+                    .or_default()
+                    .push(node.id.clone());
             }
             if let Some(children) = &node.children {
                 stack.extend(children.iter());
@@ -768,7 +833,10 @@ pub fn tree_payload(
                 });
                 if let Some(node_ids) = refs.get(hash) {
                     entry["refs"] = Value::Array(
-                        node_ids.iter().map(|id| Value::String(id.clone())).collect(),
+                        node_ids
+                            .iter()
+                            .map(|id| Value::String(id.clone()))
+                            .collect(),
                     );
                 }
                 entry
@@ -778,4 +846,89 @@ pub fn tree_payload(
     }
     compact_numbers(&mut payload);
     payload
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_item_json(extra: &str) -> Value {
+        serde_json::from_str(&format!(
+            r#"{{
+                "id": "file-1",
+                "name": "首页",
+                "type": "design",
+                "parentId": "dir-1",
+                "createdAt": "2026-01-02T03:04:05Z",
+                "updatedAt": "2026-08-10T00:00:00Z",
+                "size": {{ "width": 1440, "height": 900 }},
+                "preview": {{ "normal": "https://cdn.example.com/p.png" }}
+                {extra}
+            }}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn normalize_item_parses_metadata_and_serializes_camel_case() {
+        let row = normalize_item(&sample_item_json(""), "proj-1", None).unwrap();
+        assert_eq!(row.name, "首页");
+        assert_eq!(row.parent_id.as_deref(), Some("dir-1"));
+        assert_eq!(row.created_at.as_deref(), Some("2026-01-02T03:04:05Z"));
+        assert_eq!(row.updated_at.as_deref(), Some("2026-08-10T00:00:00Z"));
+        assert_eq!(row.width, Some(1440));
+        assert_eq!(row.height, Some(900));
+        assert_eq!(
+            row.preview.as_ref().and_then(|p| p.normal.as_deref()),
+            Some("https://cdn.example.com/p.png")
+        );
+
+        let value = serde_json::to_value(&row).unwrap();
+        let map = value.as_object().unwrap();
+        assert!(
+            map.contains_key("parentId"),
+            "must serialize camelCase parentId"
+        );
+        assert!(
+            map.contains_key("projectId"),
+            "must serialize camelCase projectId"
+        );
+        assert!(
+            map.contains_key("createdAt"),
+            "must serialize camelCase createdAt"
+        );
+        assert!(map.contains_key("width"), "width must be present");
+    }
+
+    #[test]
+    fn normalize_item_tolerates_missing_metadata() {
+        let row = normalize_item(
+            &serde_json::json!({ "id": "file-2", "name": "首页" }),
+            "proj-1",
+            None,
+        )
+        .unwrap();
+        assert!(row.created_at.is_none());
+        assert!(row.updated_at.is_none());
+        assert!(row.width.is_none());
+        assert!(row.height.is_none());
+        let value = serde_json::to_value(&row).unwrap();
+        let map = value.as_object().unwrap();
+        assert!(
+            !map.contains_key("createdAt") && !map.contains_key("width"),
+            "absent metadata must be omitted, not null"
+        );
+    }
+
+    #[test]
+    fn normalize_item_reads_flat_dimensions() {
+        let row = normalize_item(
+            &serde_json::json!({ "id": "file-3", "name": "登录", "width": 1280, "height": 720 }),
+            "proj-1",
+            None,
+        )
+        .unwrap();
+        assert_eq!(row.width, Some(1280));
+        assert_eq!(row.height, Some(720));
+    }
 }
