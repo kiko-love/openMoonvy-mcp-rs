@@ -186,9 +186,15 @@ pub fn parse_moonvy_url(url: &str) -> Option<MoonvyUrl> {
     let segments: Vec<&str> = url.split('/').filter(|s| !s.is_empty()).collect();
     let idx = segments.iter().position(|s| *s == "project")?;
     let rest = &segments[idx + 1..];
-    let project_id = rest.first()?.to_string();
-    let dir_id = rest.get(1).map(|s| s.to_string());
-    let file_id = rest.get(2).map(|s| s.to_string());
+    // Strip query string / fragment from the last segment (e.g. the
+    // `?design=` selector used by resolve_design_url) so it is never sent
+    // to the API as part of an id.
+    fn clean(s: &str) -> &str {
+        s.split(['?', '#']).next().unwrap_or(s)
+    }
+    let project_id = clean(rest.first()?).to_string();
+    let dir_id = rest.get(1).map(|s| clean(s).to_string());
+    let file_id = rest.get(2).map(|s| clean(s).to_string());
     Some(MoonvyUrl {
         project_id,
         dir_id,
@@ -227,6 +233,22 @@ mod tests {
     fn parse_moonvy_url_invalid() {
         assert!(parse_moonvy_url("https://evil.com/x").is_none());
         assert!(parse_moonvy_url("not-a-url").is_none());
+    }
+
+    #[test]
+    fn parse_moonvy_url_strips_query_and_fragment() {
+        let url = parse_moonvy_url(
+            "https://moonvy.com/project/p1/d1?design=%E9%AA%8C%E8%AF%81#top",
+        )
+        .unwrap();
+        assert_eq!(url.project_id, "p1");
+        assert_eq!(url.dir_id.as_deref(), Some("d1"));
+        assert!(url.file_id.is_none());
+
+        let url = parse_moonvy_url("https://moonvy.com/project/p1/d1/f1?design=x").unwrap();
+        assert_eq!(url.project_id, "p1");
+        assert_eq!(url.dir_id.as_deref(), Some("d1"));
+        assert_eq!(url.file_id.as_deref(), Some("f1"));
     }
 
     #[test]

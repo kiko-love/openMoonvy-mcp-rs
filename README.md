@@ -89,8 +89,10 @@ get_style_code(nodeId=...)  → 生成 CSS/Tailwind 样式片段
 | 工具 | 说明 |
 |---|---|
 | `moonvy_get_style_code` | 生成 CSS / Tailwind 样式代码（支持 nodeId 限定组件） |
-| `moonvy_get_asset_url` | 资产直链（slice/snapshot/image，不落盘） |
-| `moonvy_download_asset` | 下载切图/快照/图片填充到本地 |
+| `moonvy_get_asset_url` | 资产直链（slice/snapshot/image，不落盘），返回 resolvedType/nodeRect/artboardSize 供裁切 |
+| `moonvy_download_asset` | 下载切图/快照/图片填充到本地；`crop=true` 从快照按节点区域精确裁切（自动换算 2x 缩放） |
+
+> **切图能力**：目录 URL 支持 `?design=名称` 直接选画板（如 `...?design=验证码登录`）；图片填充无资产引用时自动降级为渲染快照并携带节点绝对坐标（nodeRect）与画板尺寸，`moonvy_download_asset` 传 `crop=true` 即可从快照中精确提取该节点区域，无需手动裁切。
 
 ### 对比与索引
 
@@ -159,7 +161,7 @@ moonvy-get_tree_by_name(name, workspaceDir)    → 直接取树
 
 ```bash
 cargo build --release          # 产物：target/release/openmoonvy-mcp-rs(.exe)
-cargo test                     # 46 个单元测试（serde 解析/树选项/diff/token/样式代码）
+cargo test                     # 55 个单元测试（serde 解析/树选项/diff/token/样式代码/裁切）
 cargo test -- --ignored --nocapture real_api_smoke   # 真实 Moonvy API 端到端实测
 ```
 

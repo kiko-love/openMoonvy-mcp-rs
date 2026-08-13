@@ -206,8 +206,9 @@ pub struct ContextRequest {
     /// Drop empty container groups and lift their children up
     #[serde(default)]
     pub skip_empty_groups: bool,
-    /// Emit coordinates relative to the artboard origin
-    #[serde(default)]
+    /// Emit coordinates relative to the artboard origin. Defaults to true —
+    /// absolute coordinates are what you want when reconstructing a page.
+    #[serde(default = "default_true")]
     pub flatten: bool,
     /// Keep only nodes of these types
     pub only: Option<Vec<String>>,
@@ -242,6 +243,11 @@ pub struct DownloadAssetRequest {
     pub name: Option<String>,
     /// Absolute output directory or file path
     pub out: Option<String>,
+    /// Crop the downloaded snapshot to the node's own area (scaled from
+    /// artboard to snapshot pixels). Useful for image fills without a direct
+    /// asset reference — the node is extracted from its rendered snapshot.
+    #[serde(default)]
+    pub crop: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -527,7 +533,7 @@ impl MoonvyServer {
 
     #[tool(
         name = "moonvy_get_asset_url",
-        description = "Resolve the direct download URL of a slice/snapshot/image without downloading. Returns { items: [ {node,name,url,type} ] } - pair with the URL in the tree's assets manifest or fetch it yourself."
+        description = "Resolve the direct download URL of a slice/snapshot/image without downloading. Returns { items: [ {node,name,url,type,resolvedType,nodeRect?,artboardSize?,snapshotHash?} ] } - nodeRect + artboardSize enable cropping the node out of the snapshot (pair with moonvy_download_asset crop=true)."
     )]
     async fn get_asset_url(
         &self,
@@ -542,14 +548,23 @@ impl MoonvyServer {
         )
         .await
         .map_err(tools::tool_error)?;
-        tools::json_string(json!({
-            "items": [{
-                "node": req.node,
-                "name": resolved.name,
-                "url": resolved.url,
-                "type": req.r#type.unwrap_or_else(|| "auto".to_string()),
-            }]
-        }))
+        let mut item = json!({
+            "node": req.node,
+            "name": resolved.name,
+            "url": resolved.url,
+            "type": req.r#type.unwrap_or_else(|| "auto".to_string()),
+            "resolvedType": resolved.resolved_type,
+        });
+        if let Some((x, y, w, h)) = resolved.node_rect {
+            item["nodeRect"] = json!([x, y, w, h]);
+        }
+        if let Some((w, h)) = resolved.artboard_size {
+            item["artboardSize"] = json!([w, h]);
+        }
+        if let Some(hash) = resolved.snapshot_hash {
+            item["snapshotHash"] = json!(hash);
+        }
+        tools::json_string(json!({ "items": [item] }))
     }
 
     #[tool(
@@ -589,7 +604,7 @@ impl MoonvyServer {
         &self,
         Parameters(req): Parameters<DownloadAssetRequest>,
     ) -> Result<String, McpError> {
-        let (save_path, size, file_name, url) = tools::download_asset(
+        let (save_path, size, file_name, url, snapshot_size) = tools::download_asset(
             &self.api,
             &req.url,
             &req.node,
@@ -597,12 +612,22 @@ impl MoonvyServer {
             req.slice_format.as_deref(),
             req.name.as_deref(),
             req.out.as_deref(),
+            req.crop,
         )
         .await
         .map_err(tools::tool_error)?;
-        tools::json_string(
-            json!({ "items": [{ "success": true, "path": save_path.to_string_lossy(), "size": size, "name": file_name, "url": url }] }),
-        )
+        let mut item = json!({
+            "success": true,
+            "path": save_path.to_string_lossy(),
+            "size": size,
+            "name": file_name,
+            "url": url,
+            "cropped": req.crop,
+        });
+        if let Some((w, h)) = snapshot_size {
+            item["snapshotSize"] = json!([w, h]);
+        }
+        tools::json_string(json!({ "items": [item] }))
     }
 
     #[tool(

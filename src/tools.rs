@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::api::{MoonvyApi, MoonvyNode, MoonvyUrl, parse_moonvy_url};
 use crate::catalog::{Catalog, CatalogDesign, search_catalog};
-use crate::genome::{Genome, GenomeNode, TreeOptions, extract_tree, find_node};
+use crate::genome::{Genome, GenomeNode, TreeOptions, absolute_rect, extract_tree, find_node};
 
 pub fn tool_error<E: std::fmt::Display>(error: E) -> McpError {
     McpError::internal_error(format!("[moonvy_error] {error}"), None)
@@ -70,18 +70,48 @@ fn write_genome_cache(key: &str, genome: &Genome) {
 }
 
 /// Auto-correct a project-directory URL to a concrete design file URL.
+/// Supports an optional `?design=<name>` query param: when present, the best
+/// matching design (case-insensitive substring) is selected instead of the
+/// first one. Without a match, the error lists the available design names so
+/// the caller can pick (e.g. "验证码登录", "密码登录").
 async fn resolve_design_url(api: &MoonvyApi, url: &str) -> anyhow::Result<String> {
     let ids = parse_ids(url)?;
     if ids.file_id.is_some() {
         return Ok(url.to_string());
     }
-    let rows = list_pages(api, url, 20, 5).await?;
-    let design = rows
+    let rows = list_pages(api, url, 500, 10).await?;
+    let designs: Vec<&PageRow> = rows
         .iter()
-        .find(|r| r.r#type == "design" && !r.url.is_empty());
-    match design {
-        Some(d) => Ok(d.url.clone()),
-        None => anyhow::bail!("Project directory has no design files"),
+        .filter(|r| r.r#type == "design" && !r.url.is_empty())
+        .collect();
+    if designs.is_empty() {
+        anyhow::bail!("Project directory has no design files");
+    }
+    // Optional `?design=` selector: substring match over design names.
+    let wanted = url::Url::parse(url)
+        .ok()
+        .and_then(|u| {
+            u.query_pairs()
+                .find(|(k, _)| k == "design")
+                .map(|(_, v)| v.to_string())
+        })
+        .filter(|v| !v.is_empty());
+    match wanted {
+        Some(w) => {
+            let lower = w.to_lowercase();
+            if let Some(hit) = designs
+                .iter()
+                .find(|d| d.name.to_lowercase().contains(&lower))
+            {
+                return Ok(hit.url.clone());
+            }
+            let names: Vec<String> = designs.iter().map(|d| d.name.clone()).collect();
+            anyhow::bail!(
+                "No design matches \"{w}\". Available designs: {}",
+                names.join(", ")
+            )
+        }
+        None => Ok(designs[0].url.clone()),
     }
 }
 
@@ -486,6 +516,79 @@ pub struct ResolvedAsset {
     pub url: String,
     pub name: String,
     pub extension: String,
+    /// Actual asset type resolved (slice|snapshot|image|image-fallback-snapshot).
+    pub resolved_type: String,
+    /// When the asset was resolved via a snapshot (own or ancestor), the
+    /// node's absolute rect in artboard coordinates, for cropping.
+    pub node_rect: Option<(f64, f64, f64, f64)>,
+    /// Snapshot hash when resolved via snapshot.
+    pub snapshot_hash: Option<String>,
+    /// Size of the containing artboard (page root) in design coordinates.
+    pub artboard_size: Option<(f64, f64)>,
+}
+
+/// Parse PNG (IHDR) or JPEG (SOF0/SOF2) dimensions from image bytes without
+/// decoding the full image. Returns (width, height).
+pub fn probe_image_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() >= 24 && bytes[0..8] == [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a] {
+        let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+        let h = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        return Some((w, h));
+    }
+    if bytes.len() >= 4 && bytes[0] == 0xff && bytes[1] == 0xd8 {
+        let mut i = 2usize;
+        while i + 9 < bytes.len() {
+            if bytes[i] != 0xff {
+                i += 1;
+                continue;
+            }
+            let marker = bytes[i + 1];
+            // SOF0..SOF15 (except DHT C4, JPG C8, DAC CC)
+            if matches!(marker, 0xc0..=0xcf) && !matches!(marker, 0xc4 | 0xc8 | 0xcc) {
+                let h = u16::from_be_bytes([bytes[i + 5], bytes[i + 6]]);
+                let w = u16::from_be_bytes([bytes[i + 7], bytes[i + 8]]);
+                return Some((w as u32, h as u32));
+            }
+            let seg_len = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
+            i += 2 + seg_len;
+        }
+    }
+    None
+}
+
+/// Crop a downloaded snapshot to the node's absolute rect, scaled from
+/// artboard coordinates to snapshot pixels. Returns the cropped PNG bytes.
+pub fn crop_snapshot_bytes(
+    bytes: &[u8],
+    artboard_size: (f64, f64),
+    node_rect: (f64, f64, f64, f64),
+) -> anyhow::Result<Vec<u8>> {
+    let (aw, ah) = artboard_size;
+    if aw <= 0.0 || ah <= 0.0 {
+        anyhow::bail!("Invalid artboard size {aw}x{ah}");
+    }
+    let img = image::load_from_memory(bytes)
+        .map_err(|e| anyhow::anyhow!("Failed to decode snapshot image: {e}"))?;
+    let (sw, sh) = (img.width(), img.height());
+    let scale_x = sw as f64 / aw;
+    let scale_y = sh as f64 / ah;
+    let (nx, ny, nw, nh) = node_rect;
+    let x = (nx * scale_x).round() as u32;
+    let y = (ny * scale_y).round() as u32;
+    let w = (nw * scale_x).round() as u32;
+    let h = (nh * scale_y).round() as u32;
+    let w = w.max(1);
+    let h = h.max(1);
+    let x = x.min(sw.saturating_sub(1));
+    let y = y.min(sh.saturating_sub(1));
+    let w = w.min(sw - x);
+    let h = h.min(sh - y);
+    let cropped = img.crop_imm(x, y, w.max(1), h.max(1));
+    let mut out = Vec::new();
+    cropped
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .map_err(|e| anyhow::anyhow!("Failed to encode cropped PNG: {e}"))?;
+    Ok(out)
 }
 
 /// Resolve the download URL of a slice/snapshot/image from a Moonvy node
@@ -502,6 +605,10 @@ pub async fn resolve_asset(
     let mut download_url: Option<String> = None;
     let mut fallback_name = "asset".to_string();
     let mut asset_extension = String::new();
+    let mut resolved_type = String::new();
+    let mut node_rect: Option<(f64, f64, f64, f64)> = None;
+    let mut snapshot_hash: Option<String> = None;
+    let mut artboard_size: Option<(f64, f64)> = None;
 
     if let Some(file_id) = &ids.file_id {
         let file_node = api.get_node(&ids.project_id, file_id, "full").await?;
@@ -520,6 +627,13 @@ pub async fn resolve_asset(
                     .ok_or_else(|| anyhow::anyhow!("No genome file found"))?,
             )
             .await?;
+        // Artboard size = containing page root rect (for snapshot crop scaling).
+        artboard_size = genome
+            .pages
+            .iter()
+            .find(|p| find_node(p, node).is_some())
+            .and_then(|p| p.rect.clone())
+            .map(|r| (r.w, r.h));
 
         let layer = genome
             .pages
@@ -528,7 +642,7 @@ pub async fn resolve_asset(
             .cloned();
         if let Some(layer) = layer {
             fallback_name = layer.name.clone().unwrap_or_else(|| "unnamed".to_string());
-            let resolved_type = r#type.map(str::to_string).unwrap_or_else(|| {
+            let inferred_type = r#type.map(str::to_string).unwrap_or_else(|| {
                 if layer.slices.as_ref().and_then(|s| s.as_object()).is_some() {
                     "slice".to_string()
                 } else if layer.snapshot.is_some() {
@@ -543,8 +657,9 @@ pub async fn resolve_asset(
                     "snapshot".to_string()
                 }
             });
+            resolved_type = inferred_type.clone();
 
-            match resolved_type.as_str() {
+            match inferred_type.as_str() {
                 "slice" => {
                     let slices = layer
                         .slices
@@ -574,12 +689,14 @@ pub async fn resolve_asset(
                         .snapshot
                         .clone()
                         .or_else(|| layer.snapshot_preview.clone());
+                    let mut snapshot_source = "own".to_string();
                     if hash.is_none()
                         && let Some(layer_id) = layer.id.as_deref()
                         && let Some((parent_hash, parent_name)) =
                             find_parent_snapshot(&genome, layer_id)
                     {
                         hash = Some(parent_hash);
+                        snapshot_source = "ancestor".to_string();
                         if let Some(parent_name) = parent_name {
                             fallback_name = parent_name;
                         }
@@ -589,6 +706,13 @@ pub async fn resolve_asset(
                     })?;
                     download_url = Some(resolve_asset_url(&hash, &assets, &genome));
                     asset_extension = ".png".to_string();
+                    resolved_type = format!("snapshot:{snapshot_source}");
+                    snapshot_hash = Some(hash);
+                    node_rect = layer
+                        .id
+                        .as_deref()
+                        .and_then(|id| absolute_rect(&genome, id))
+                        .map(|r| (r.x, r.y, r.w, r.h));
                 }
                 "image" => {
                     let image_fill = layer
@@ -602,16 +726,56 @@ pub async fn resolve_asset(
                                 .or_else(|| f.id.clone())
                                 .or_else(|| f.hash.clone())
                         })
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("Image fill does not have a valid asset reference.")
-                        })?;
-                    download_url = Some(resolve_asset_url(&hash, &assets, &genome));
-                    asset_extension = genome
-                        .images
-                        .get(&hash)
-                        .and_then(|i| i.r#type.clone())
-                        .map(|t| format!(".{t}"))
-                        .unwrap_or_else(|| ".png".to_string());
+                        .filter(|h| {
+                            // A hash only counts when it actually resolves to a
+                            // URL (assets manifest or genome.images); otherwise
+                            // treat the fill as having no asset reference and
+                            // fall back to the rendered snapshot.
+                            !h.is_empty()
+                                && (assets.contains_key(h) || genome.images.contains_key(h))
+                        });
+                    if let Some(hash) = hash {
+                        download_url = Some(resolve_asset_url(&hash, &assets, &genome));
+                        asset_extension = genome
+                            .images
+                            .get(&hash)
+                            .and_then(|i| i.r#type.clone())
+                            .map(|t| format!(".{t}"))
+                            .unwrap_or_else(|| ".png".to_string());
+                    } else if let Some(layer_id) = layer.id.as_deref() {
+                        // Fallback: image fill without a resolvable asset
+                        // reference — use the node's own rendered snapshot,
+                        // or the nearest ancestor's, and record the node rect
+                        // so callers can crop exactly the node's area.
+                        let mut hash = layer
+                            .snapshot
+                            .clone()
+                            .or_else(|| layer.snapshot_preview.clone());
+                        let mut snapshot_source = "own".to_string();
+                        if hash.is_none() {
+                            if let Some((parent_hash, _parent_name)) =
+                                find_parent_snapshot(&genome, layer_id)
+                            {
+                                hash = Some(parent_hash);
+                                snapshot_source = "ancestor".to_string();
+                            }
+                        }
+                        if let Some(hash) = hash {
+                            download_url = Some(resolve_asset_url(&hash, &assets, &genome));
+                            asset_extension = ".png".to_string();
+                            resolved_type =
+                                format!("image-fallback-snapshot:{snapshot_source}");
+                            snapshot_hash = Some(hash);
+                            node_rect =
+                                absolute_rect(&genome, layer_id).map(|r| (r.x, r.y, r.w, r.h));
+                        } else {
+                            anyhow::bail!(
+                                "Image fill does not have a valid asset reference and no snapshot fallback exists."
+                            );
+                        }
+                    } else {
+                        anyhow::bail!("Image fill does not have a valid asset reference.");
+                    }
                 }
                 other => anyhow::bail!("Invalid type: {other}"),
             }
@@ -656,10 +820,18 @@ pub async fn resolve_asset(
         url,
         name: fallback_name,
         extension: asset_extension,
+        resolved_type,
+        node_rect,
+        snapshot_hash,
+        artboard_size,
     })
 }
 
-/// Download a slice/snapshot/image from a Moonvy node; returns (path, size, name, url).
+/// Download a slice/snapshot/image from a Moonvy node; returns
+/// (path, size, name, url, snapshot_size).
+/// When `crop` is true and the asset resolved via a snapshot with a known
+/// node rect + artboard size, the downloaded image is cropped to the node's
+/// area (scaled from artboard to snapshot pixels) and saved as PNG.
 pub async fn download_asset(
     api: &MoonvyApi,
     url: &str,
@@ -668,9 +840,31 @@ pub async fn download_asset(
     slice_format: Option<&str>,
     name: Option<&str>,
     out: Option<&str>,
-) -> anyhow::Result<(PathBuf, u64, String, String)> {
+    crop: bool,
+) -> anyhow::Result<(PathBuf, u64, String, String, Option<(u32, u32)>)> {
     let resolved = resolve_asset(api, url, node, r#type, slice_format).await?;
-    let bytes = api.download_file(&resolved.url).await?;
+    let mut bytes = api.download_file(&resolved.url).await?;
+
+    // Report the original (pre-crop) pixel size of the downloaded image so
+    // callers can compute the snapshot scale vs. artboard size.
+    let snapshot_size = probe_image_size(&bytes);
+
+    // Crop to the node rect when requested and geometry is available. The
+    // snapshot pixels are scaled from artboard coordinates by the ratio of
+    // snapshot size to artboard size (Moonvy renders 2x by default, so a
+    // 1440x900 artboard becomes a 2880x1800 snapshot).
+    let (extension, extra_suffix) = if crop {
+        match (resolved.node_rect, resolved.artboard_size) {
+            (Some(node_rect), Some(artboard)) => {
+                let cropped = crop_snapshot_bytes(&bytes, artboard, node_rect)?;
+                bytes = cropped;
+                (".png".to_string(), "_crop".to_string())
+            }
+            _ => (resolved.extension.clone(), String::new()),
+        }
+    } else {
+        (resolved.extension.clone(), String::new())
+    };
 
     let out_path = PathBuf::from(out.unwrap_or("."));
     if !out_path.is_absolute() {
@@ -698,11 +892,23 @@ pub async fn download_asset(
     };
     std::fs::create_dir_all(&out_dir)?;
     let base_name = name.unwrap_or(&resolved.name).to_string();
-    let final_name =
-        file_name.unwrap_or_else(|| format!("{}{}", sanitize_name(&base_name), resolved.extension));
+    let final_name = file_name.unwrap_or_else(|| {
+        let stem = sanitize_name(&base_name);
+        if extra_suffix.is_empty() {
+            format!("{stem}{extension}")
+        } else {
+            format!("{stem}{extra_suffix}{extension}")
+        }
+    });
     let save_path = out_dir.join(&final_name);
     std::fs::write(&save_path, &bytes)?;
-    Ok((save_path, bytes.len() as u64, final_name, resolved.url))
+    Ok((
+        save_path,
+        bytes.len() as u64,
+        final_name,
+        resolved.url,
+        snapshot_size,
+    ))
 }
 
 /* -------------------------------- catalog ---------------------------------- */
@@ -930,5 +1136,98 @@ mod tests {
         .unwrap();
         assert_eq!(row.width, Some(1280));
         assert_eq!(row.height, Some(720));
+    }
+
+    #[test]
+    fn probe_png_dimensions_from_ihdr() {
+        // Minimal valid PNG header: 8-byte signature + IHDR chunk with
+        // width=2880 (0x0B40), height=1800 (0x0708).
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        bytes.extend_from_slice(&[
+            0x00, 0x00, 0x00, 0x0d, // IHDR length
+            b'I', b'H', b'D', b'R',
+            0x00, 0x00, 0x0b, 0x40, // width 2880
+            0x00, 0x00, 0x07, 0x08, // height 1800
+            0x08, 0x06, 0x00, 0x00, 0x00, // bit depth, color type, compression, filter, interlace
+            0x00, 0x00, 0x00, 0x00, // CRC placeholder
+        ]);
+        let (w, h) = probe_image_size(&bytes).expect("png dims");
+        assert_eq!((w, h), (2880, 1800));
+    }
+
+    #[test]
+    fn probe_jpeg_dimensions_from_sof() {
+        // SOI + APP0 + SOF0: width 1440, height 900.
+        let mut bytes = vec![0xff, 0xd8, 0xff, 0xe0];
+        bytes.extend_from_slice(&[0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00]);
+        bytes.extend_from_slice(&[0xff, 0xc0, 0x00, 0x11, 0x08]);
+        bytes.extend_from_slice(&[0x03, 0x84, 0x05, 0xa0]); // h=900, w=1440
+        bytes.extend_from_slice(&[0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00]);
+        let (w, h) = probe_image_size(&bytes).expect("jpeg dims");
+        assert_eq!((w, h), (1440, 900));
+    }
+
+    #[test]
+    fn probe_returns_none_for_garbage() {
+        assert!(probe_image_size(b"not an image at all").is_none());
+        assert!(probe_image_size(&[]).is_none());
+    }
+
+    #[test]
+    fn crop_scales_artboard_to_snapshot_pixels() {
+        // 1x1 red PNG decoded via image crate; artboard 1440x900, snapshot
+        // rendered at 2x (2880x1800) — build the 2x snapshot by constructing
+        // a small image and checking the crop math on a node rect.
+        let mut img = image::RgbaImage::new(4, 2);
+        for px in img.pixels_mut() {
+            *px = image::Rgba([255, 0, 0, 255]);
+        }
+        let mut png = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut png),
+            image::ImageFormat::Png,
+        )
+        .expect("encode png");
+
+        // Artboard 4x2 (simulating 1440x900 at 1/360 scale), node rect
+        // covering the left half: [0,0,2,2] -> snapshot pixels [0,0,2,2].
+        let cropped = crop_snapshot_bytes(&png, (4.0, 2.0), (0.0, 0.0, 2.0, 2.0)).expect("crop");
+        let decoded = image::load_from_memory(&cropped).expect("decode cropped");
+        assert_eq!((decoded.width(), decoded.height()), (2, 2));
+
+        // Right-half crop [2,0,2,2] must land within bounds.
+        let cropped2 = crop_snapshot_bytes(&png, (4.0, 2.0), (2.0, 0.0, 2.0, 2.0)).expect("crop");
+        let decoded2 = image::load_from_memory(&cropped2).expect("decode cropped");
+        assert_eq!((decoded2.width(), decoded2.height()), (2, 2));
+    }
+
+    #[test]
+    fn crop_clamps_out_of_bounds_rect() {
+        let mut img = image::RgbaImage::new(2, 2);
+        for px in img.pixels_mut() {
+            *px = image::Rgba([0, 0, 255, 255]);
+        }
+        let mut png = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut png),
+            image::ImageFormat::Png,
+        )
+        .expect("encode png");
+        // Node rect partially outside the artboard: must clamp, not panic.
+        let cropped = crop_snapshot_bytes(&png, (2.0, 2.0), (1.5, 1.5, 4.0, 4.0)).expect("crop");
+        assert!(!cropped.is_empty());
+    }
+
+    #[test]
+    fn crop_rejects_zero_artboard() {
+        let mut img = image::RgbaImage::new(1, 1);
+        img.put_pixel(0, 0, image::Rgba([0, 0, 0, 255]));
+        let mut png = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut png),
+            image::ImageFormat::Png,
+        )
+        .expect("encode png");
+        assert!(crop_snapshot_bytes(&png, (0.0, 0.0), (0.0, 0.0, 1.0, 1.0)).is_err());
     }
 }

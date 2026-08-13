@@ -101,6 +101,9 @@ pub struct TextSegment {
 pub struct Textbox {
     pub text: Option<String>,
     pub segments: Vec<TextSegment>,
+    /// Horizontal alignment of the text block ("left"|"center"|"right"|"justify"),
+    /// when exported by the source tool.
+    pub align: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -217,6 +220,10 @@ pub struct NodeStyle {
     pub stroke_color: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gradient: Option<GradientStyle>,
+    /// Horizontal text alignment ("left"|"center"|"right"|"justify"); only
+    /// set on text nodes when the source exports it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_align: Option<String>,
 }
 
 /// 400 is the default weight; omitted when unset or regular.
@@ -383,6 +390,7 @@ pub fn extract_raw_node_style(genome: &Genome, raw: &GenomeNode) -> NodeStyle {
         stroke_width: stroke.and_then(|s| s.w),
         stroke_color: stroke.and_then(|s| resolve_fill_color(s.fills.first())),
         gradient,
+        text_align: raw.textbox.as_ref().and_then(|t| t.align.clone()),
     }
 }
 
@@ -879,6 +887,46 @@ pub fn find_node<'a>(node: &'a GenomeNode, target_id: &str) -> Option<&'a Genome
     for child in &node.children {
         if let Some(found) = find_node(child, target_id) {
             return Some(found);
+        }
+    }
+    None
+}
+
+/// Absolute rect (x, y, w, h) of a node relative to its page artboard origin.
+/// Walks the ancestor chain and accumulates rect offsets, mirroring the
+/// `flatten` behavior of extract_tree (the page root's own offset is zeroed).
+/// Used by snapshot cropping so the crop region matches the flattened tree.
+pub fn absolute_rect(genome: &Genome, node_id: &str) -> Option<Rect> {
+    fn walk<'a>(node: &'a GenomeNode, target_id: &str, acc_x: f64, acc_y: f64) -> Option<Rect> {
+        let rect = node.rect.clone().unwrap_or_default();
+        let x = acc_x + rect.x;
+        let y = acc_y + rect.y;
+        if ids_equal(node.id.as_deref(), Some(target_id)) {
+            return Some(Rect {
+                x,
+                y,
+                w: rect.w,
+                h: rect.h,
+            });
+        }
+        for child in &node.children {
+            if let Some(found) = walk(child, target_id, x, y) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    for page in &genome.pages {
+        // Flattened coordinates zero the page root offset: start the walk
+        // from the root's own rect so children accumulate relative to it.
+        if let Some(found) = walk(page, node_id, 0.0, 0.0) {
+            let root_rect = page.rect.clone().unwrap_or_default();
+            return Some(Rect {
+                x: found.x - root_rect.x,
+                y: found.y - root_rect.y,
+                w: found.w,
+                h: found.h,
+            });
         }
     }
     None
@@ -1669,6 +1717,7 @@ mod tests {
                                 }),
                                 textbox: Some(Textbox {
                                     text: Some("LOGO".into()),
+                                    align: None,
                                     segments: vec![TextSegment {
                                         font_size: Some(16.0),
                                         font_weight: Some(700.0),
@@ -3490,7 +3539,7 @@ mod tests {
         // 7. Real asset download to a temp dir (design-level snapshot).
         let out_dir = std::env::temp_dir().join("moonvy-smoke-out");
         std::fs::create_dir_all(&out_dir).expect("tmp dir");
-        let (path, size, name, _url) = download_asset(
+        let (path, size, name, _url, _snapshot_size) = download_asset(
             &api,
             &profile.url,
             &profile.id,
@@ -3498,6 +3547,7 @@ mod tests {
             None,
             Some("smoke-design"),
             Some(out_dir.to_str().expect("absolute tmp path")),
+            false,
         )
         .await
         .expect("download design snapshot");
@@ -3509,6 +3559,126 @@ mod tests {
         assert!(size > 0, "downloaded file must not be empty");
         assert!(path.exists(), "downloaded file must exist");
         let _ = std::fs::remove_dir_all(&out_dir);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network"]
+    async fn login_design_crop_e2e() {
+        // End-to-end check of the two biggest real-world pain points:
+        // 1. ?design= selector on a directory URL picks the login board.
+        // 2. An image fill without an asset reference falls back to the
+        //    rendered snapshot and crop=true extracts the node's exact area.
+        use crate::api::MoonvyApi;
+        use crate::token;
+        use crate::tools::{download_asset, genome_for_url, resolve_asset};
+
+        let token = token::load_token().expect("token");
+        let api = MoonvyApi::new(token).expect("api");
+        // Directory URL + ?design= selector: must resolve to 验证码登录 board.
+        let dir_url = "https://moonvy.com/project/4cf87739-556a-48e7-84f4-bd76f660a48a/75168c2b-5761-4edd-8c94-cd4adaa7d8da?design=%E9%AA%8C%E8%AF%81%E7%A0%81%E7%99%BB%E5%BD%95";
+        let (ids, genome) = genome_for_url(&api, dir_url).await.expect("genome via ?design=");
+        println!(
+            "1) ?design=验证码登录 -> board={} frame={}x{}",
+            genome.pages[0].name.as_deref().unwrap_or("?"),
+            genome.pages[0].rect.as_ref().map(|r| r.w).unwrap_or(0.0),
+            genome.pages[0].rect.as_ref().map(|r| r.h).unwrap_or(0.0)
+        );
+        assert!(
+            ids.file_id.as_deref() == Some("a4dd31b7-1381-44dc-ad3c-75532619de23"),
+            "must resolve to the 验证码登录 board"
+        );
+        assert_eq!(
+            genome.pages[0].name.as_deref(),
+            Some("验证码登录-默认"),
+            "board name must be 验证码登录-默认"
+        );
+
+        // Locate the left cover image node (dl_bg) inside the board.
+        let cover = genome
+            .pages
+            .iter()
+            .find_map(|p| crate::genome::find_node(p, "d1069114-8c39-4903-9e1d-5f8c3fbe8ec7"))
+            .expect("cover node");
+        println!(
+            "3) cover node: \"{}\" rect={:?} snapshot={:?}",
+            cover.name.as_deref().unwrap_or("?"),
+            cover.rect,
+            cover.snapshot.is_some()
+        );
+
+        // Asset resolution without explicit type: dl_bg carries a slice, so
+        // autodetection must hit the slice branch (this is the "切图" the
+        // design exports for the cover).
+        let file_url = "https://moonvy.com/project/4cf87739-556a-48e7-84f4-bd76f660a48a/75168c2b-5761-4edd-8c94-cd4adaa7d8da/a4dd31b7-1381-44dc-ad3c-75532619de23";
+        let asset = resolve_asset(&api, file_url, &cover.id.clone().unwrap(), None, None)
+            .await
+            .expect("resolve cover");
+        println!(
+            "4) resolved(cover): type={} url={}",
+            asset.resolved_type, asset.url
+        );
+        assert!(
+            asset.resolved_type == "slice",
+            "dl_bg exports a slice, got {}",
+            asset.resolved_type
+        );
+        assert!(asset.url.starts_with("https://"), "slice must have a URL");
+
+        // The QR placeholder image in the WeChat board has neither a slice
+        // nor a resolvable image hash: must fall back to the snapshot and
+        // expose the node rect for cropping.
+        let wechat_url = "https://moonvy.com/project/4cf87739-556a-48e7-84f4-bd76f660a48a/75168c2b-5761-4edd-8c94-cd4adaa7d8da/f168943c-a9ac-419d-bbfe-139b476d52f4";
+        let qr = resolve_asset(&api, wechat_url, "3832470b-2b79-4fa3-8306-17daceead742", None, None)
+            .await
+            .expect("resolve qr");
+        println!(
+            "4b) resolved(qr): type={} nodeRect={:?} artboard={:?}",
+            qr.resolved_type, qr.node_rect, qr.artboard_size
+        );
+        assert!(
+            qr.resolved_type.starts_with("image-fallback-snapshot"),
+            "qr must fall back to snapshot, got {}",
+            qr.resolved_type
+        );
+        assert!(qr.node_rect.is_some(), "crop geometry must be exposed");
+
+        // Crop the QR node out of the page snapshot to a temp file.
+        let out_dir = std::env::temp_dir().join("moonvy-login-crop");
+        let _ = std::fs::remove_dir_all(&out_dir);
+        std::fs::create_dir_all(&out_dir).expect("tmp dir");
+        let (path, size, name, _url, snap_size) = download_asset(
+            &api,
+            wechat_url,
+            "3832470b-2b79-4fa3-8306-17daceead742",
+            None,
+            None,
+            Some("wechat_qr"),
+            Some(out_dir.to_str().expect("absolute tmp path")),
+            true,
+        )
+        .await
+        .expect("crop qr");
+        println!(
+            "5) crop: \"{name}\" -> {} ({} bytes) snapshot={:?}",
+            path.display(),
+            size,
+            snap_size
+        );
+        assert!(size > 0, "cropped file must not be empty");
+        assert!(path.exists(), "cropped file must exist");
+        if let Some((sw, sh)) = snap_size {
+            println!("   snapshot pixel size: {sw}x{sh}");
+            // QR node rect 200x200 at artboard 1440x900; snapshot is 2880x1800
+            // (2x), so the cropped PNG must be 400x400.
+            let decoded = image::load_from_memory(
+                &std::fs::read(&path).expect("read cropped png"),
+            )
+            .expect("decode cropped png");
+            assert_eq!((decoded.width(), decoded.height()), (400, 400));
+        }
+        // Clean up.
+        let _ = std::fs::remove_dir_all(&out_dir);
+        let _ = ids;
     }
 
     #[tokio::test]
@@ -3645,5 +3815,95 @@ mod tests {
             .join("repro.txt");
         std::fs::write(&out, &log).expect("write log");
         print!("{log}");
+    }
+
+    #[test]
+    fn absolute_rect_accumulates_ancestor_offsets() {
+        let genome = Genome {
+            pages: vec![GenomeNode {
+                id: Some("page-1".into()),
+                name: Some("画板".into()),
+                r#type: Some("artboard".into()),
+                rect: Some(Rect {
+                    x: 100.0,
+                    y: 50.0,
+                    w: 1440.0,
+                    h: 900.0,
+                }),
+                children: vec![GenomeNode {
+                    id: Some("group-1".into()),
+                    name: Some("表单".into()),
+                    r#type: Some("group".into()),
+                    rect: Some(Rect {
+                        x: 300.0,
+                        y: 200.0,
+                        w: 500.0,
+                        h: 400.0,
+                    }),
+                    children: vec![GenomeNode {
+                        id: Some("input-1".into()),
+                        name: Some("输入框".into()),
+                        r#type: Some("rectangle".into()),
+                        rect: Some(Rect {
+                            x: 20.0,
+                            y: 30.0,
+                            w: 300.0,
+                            h: 44.0,
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            styles: None,
+            images: std::collections::HashMap::new(),
+        };
+
+        // Page root offset (100,50) is zeroed, group offset (300,200) +
+        // input offset (20,30) accumulate: absolute = (320, 230).
+        let rect = absolute_rect(&genome, "input-1").expect("input rect");
+        assert_eq!((rect.x, rect.y, rect.w, rect.h), (320.0, 230.0, 300.0, 44.0));
+
+        // The page itself is at (0,0) in flattened space.
+        let page = absolute_rect(&genome, "page-1").expect("page rect");
+        assert_eq!((page.x, page.y, page.w, page.h), (0.0, 0.0, 1440.0, 900.0));
+
+        // Unknown node id -> None.
+        assert!(absolute_rect(&genome, "nope").is_none());
+    }
+
+    #[test]
+    fn absolute_rect_without_page_offset_keeps_root_at_zero() {
+        let genome = Genome {
+            pages: vec![GenomeNode {
+                id: Some("page-1".into()),
+                name: Some("画板".into()),
+                r#type: Some("artboard".into()),
+                rect: Some(Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 800.0,
+                    h: 600.0,
+                }),
+                children: vec![GenomeNode {
+                    id: Some("btn".into()),
+                    name: Some("按钮".into()),
+                    r#type: Some("rectangle".into()),
+                    rect: Some(Rect {
+                        x: 100.0,
+                        y: 120.0,
+                        w: 160.0,
+                        h: 48.0,
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            styles: None,
+            images: std::collections::HashMap::new(),
+        };
+        let rect = absolute_rect(&genome, "btn").expect("btn rect");
+        assert_eq!((rect.x, rect.y, rect.w, rect.h), (100.0, 120.0, 160.0, 48.0));
     }
 }
