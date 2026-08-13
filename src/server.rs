@@ -533,13 +533,13 @@ impl MoonvyServer {
 
     #[tool(
         name = "moonvy_get_asset_url",
-        description = "Resolve the direct download URL of a slice/snapshot/image without downloading. Returns { items: [ {node,name,url,type,resolvedType,nodeRect?,artboardSize?,snapshotHash?} ] } - nodeRect + artboardSize enable cropping the node out of the snapshot (pair with moonvy_download_asset crop=true)."
+        description = "Resolve the direct download URL of a slice/snapshot/image without downloading. Returns { items: [ {node,name,url,type,resolvedType,nodeRect?,artboardSize?,snapshotHash?} ] } - nodeRect + artboardSize enable cropping the node out of the snapshot (pair with moonvy_download_asset crop=true). When the node has no asset of the requested type (e.g. type=slice on a non-slice node), resolvedType is \"none\" with a message instead of an error - retry with type=snapshot or type=image."
     )]
     async fn get_asset_url(
         &self,
         Parameters(req): Parameters<AssetUrlRequest>,
     ) -> Result<String, McpError> {
-        let resolved = tools::resolve_asset(
+        let resolved = match tools::resolve_asset(
             &self.api,
             &req.url,
             &req.node,
@@ -547,7 +547,27 @@ impl MoonvyServer {
             req.slice_format.as_deref(),
         )
         .await
-        .map_err(tools::tool_error)?;
+        {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let message = error.to_string();
+                // A node without that kind of asset is a normal outcome (e.g.
+                // type=slice on a non-slice node), not a server fault. Report
+                // it as structured data so the model can retry with a
+                // different asset type instead of hitting a -32603.
+                if tools::is_asset_unavailable(&message) {
+                    return tools::json_string(json!({
+                        "items": [{
+                            "node": req.node,
+                            "type": req.r#type.clone().unwrap_or_else(|| "auto".to_string()),
+                            "resolvedType": "none",
+                            "message": message,
+                        }]
+                    }));
+                }
+                return Err(tools::tool_error(error));
+            }
+        };
         let mut item = json!({
             "node": req.node,
             "name": resolved.name,

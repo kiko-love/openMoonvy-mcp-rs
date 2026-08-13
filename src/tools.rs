@@ -591,6 +591,21 @@ pub fn crop_snapshot_bytes(
     Ok(out)
 }
 
+/// True when a resolve_asset error means "this node simply does not have that
+/// kind of asset" (vs. token/network/auth failures). Callers surface these as
+/// a structured "not available" hint so the model can switch asset type.
+pub fn is_asset_unavailable(message: &str) -> bool {
+    let m = message.to_lowercase();
+    m.contains("does not have slices")
+        || m.contains("not found on slice")
+        || m.contains("no snapshot found")
+        || m.contains("image fill does not have")
+        || m.contains("invalid type")
+        || m.contains("no download url")
+        || m.contains("downloadable asset")
+        || m.contains("no slice export")
+}
+
 /// Resolve the download URL of a slice/snapshot/image from a Moonvy node
 /// without fetching the bytes. Shared by moonvy_download_asset (which then
 /// downloads and persists) and moonvy_get_asset_url (URL-only).
@@ -1229,5 +1244,29 @@ mod tests {
         )
         .expect("encode png");
         assert!(crop_snapshot_bytes(&png, (0.0, 0.0), (0.0, 0.0, 1.0, 1.0)).is_err());
+    }
+
+    #[test]
+    fn asset_unavailable_classifier() {
+        // Asset-type misses must be surfaced as "not available", not errors.
+        for msg in [
+            "Node does not have slices.",
+            "Format \"svg\" not found on slice.",
+            "No snapshot found for this node or its parents.",
+            "Image fill does not have a valid asset reference.",
+            "Invalid type: foo",
+            "Node does not have any downloadable asset or preview.",
+        ] {
+            assert!(is_asset_unavailable(msg), "should classify: {msg}");
+        }
+        // Real failures (auth/network) stay as errors.
+        for msg in [
+            "request failed with status 401",
+            "connection reset by peer",
+            "genome fetch timed out",
+            "failed to decode snapshot image",
+        ] {
+            assert!(!is_asset_unavailable(msg), "should NOT classify: {msg}");
+        }
     }
 }
