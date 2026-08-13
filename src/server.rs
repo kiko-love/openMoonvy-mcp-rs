@@ -944,6 +944,21 @@ fn arg(request: &rmcp::model::GetPromptRequestParams, key: &str) -> Option<Strin
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for MoonvyServer {
+    fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> impl std::future::Future<Output = Result<rmcp::model::CallToolResponse, McpError>>
+    + rmcp::service::MaybeSendFuture
+    + '_ {
+        // Lifecycle: record activity so the optional idle-timeout watchdog
+        // does not kill the server while a session is actively using it.
+        crate::touch_activity();
+        self.tool_router.call(
+            rmcp::handler::server::tool::ToolCallContext::new(self, request, context),
+        )
+    }
+
     fn get_info(&self) -> ServerInfo {
         let mut implementation = Implementation::from_build_env();
         implementation.name = "openmoonvy-mcp-rs".to_string();

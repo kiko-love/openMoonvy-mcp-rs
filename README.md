@@ -145,6 +145,16 @@ get_style_code(nodeId=...)  → 生成 CSS/Tailwind 样式片段
 
 `MOONVY_WORKSPACE_DIR`（可选）启用 catalog/aliases 资源与 workspace 自动补全。
 
+### 进程生命周期
+
+MCP 服务器进程不会常驻后台，以下任一条件触发自动退出：
+
+1. **stdin 关闭**（MCP 客户端正常断开 / opencode 退出）——rmcp stdio 传输结束
+2. **父进程消失**（客户端异常退出/被杀，未关闭管道）——内置 watchdog 每 3 秒检查父进程，消失即退出
+3. **空闲超时**（可选）——设置 `MOONVY_IDLE_TIMEOUT_SECS=600` 后，连续 10 分钟无工具调用自动退出；每次工具调用都会刷新计时
+
+如需完全禁用常驻（每次调用都拉新进程），由 MCP 客户端配置 `commandTimeout`/会话管理实现。
+
 ## 工作区索引
 
 `moonvy_sync_project` 将 Moonvy 项目扫描写入 `.moonvy-mcp/catalog.json`，此后可按名称/别名/标签检索设计，无需记忆 URL：
